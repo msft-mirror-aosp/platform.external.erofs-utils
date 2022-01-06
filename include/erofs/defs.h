@@ -8,6 +8,11 @@
 #ifndef __EROFS_DEFS_H
 #define __EROFS_DEFS_H
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <assert.h>
@@ -82,7 +87,9 @@ typedef int64_t         s64;
 #endif
 #endif
 
-#ifndef __OPTIMIZE__
+#ifdef __cplusplus
+#define BUILD_BUG_ON(condition) static_assert(!(condition))
+#elif !defined(__OPTIMIZE__)
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2 * !!(condition)]))
 #else
 #define BUILD_BUG_ON(condition) assert(!(condition))
@@ -110,6 +117,8 @@ typedef int64_t         s64;
 }							\
 )
 
+/* Can easily conflict with C++'s std::min */
+#ifndef __cplusplus
 #define min(x, y) ({				\
 	typeof(x) _min1 = (x);			\
 	typeof(y) _min2 = (y);			\
@@ -121,6 +130,7 @@ typedef int64_t         s64;
 	typeof(y) _max2 = (y);			\
 	(void) (&_max1 == &_max2);		\
 	_max1 > _max2 ? _max1 : _max2; })
+#endif
 
 /*
  * ..and if you can't take the strict types, you can specify one yourself.
@@ -252,6 +262,38 @@ static inline u32 get_unaligned_le32(const u8 *p)
 	(n) & (1ULL <<  1) ?  1 : 0	\
 )
 
+static inline unsigned int fls_long(unsigned long x)
+{
+	return x ? sizeof(x) * 8 - __builtin_clz(x) : 0;
+}
+
+/**
+ * __roundup_pow_of_two() - round up to nearest power of two
+ * @n: value to round up
+ */
+static inline __attribute__((const))
+unsigned long __roundup_pow_of_two(unsigned long n)
+{
+	return 1UL << fls_long(n - 1);
+}
+
+/**
+ * roundup_pow_of_two - round the given value up to nearest power of two
+ * @n: parameter
+ *
+ * round the given value up to the nearest power of two
+ * - the result is undefined when n == 0
+ * - this can be used to initialise global variables from constant data
+ */
+#define roundup_pow_of_two(n)			\
+(						\
+	__builtin_constant_p(n) ? (		\
+		((n) == 1) ? 1 :		\
+		(1UL << (ilog2((n) - 1) + 1))	\
+				   ) :		\
+	__roundup_pow_of_two(n)			\
+)
+
 #ifndef __always_inline
 #define __always_inline	inline
 #endif
@@ -276,4 +318,9 @@ static inline u32 get_unaligned_le32(const u8 *p)
 #define stat64		stat
 #define lstat64		lstat
 #endif
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

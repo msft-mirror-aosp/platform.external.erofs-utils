@@ -8,6 +8,11 @@
 #ifndef __EROFS_CACHE_H
 #define __EROFS_CACHE_H
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 #include "internal.h"
 
 struct erofs_buffer_head;
@@ -19,6 +24,8 @@ struct erofs_buffer_block;
 #define INODE		2
 /* shared xattrs */
 #define XATTR		3
+/* device table */
+#define DEVT		4
 
 struct erofs_bhops {
 	bool (*preflush)(struct erofs_buffer_head *bh);
@@ -56,6 +63,9 @@ static inline const int get_alignsize(int type, int *type_ret)
 	} else if (type == XATTR) {
 		*type_ret = META;
 		return sizeof(struct erofs_xattr_entry);
+	} else if (type == DEVT) {
+		*type_ret = META;
+		return EROFS_DEVT_SLOT_SIZE;
 	}
 
 	if (type == META)
@@ -98,5 +108,9 @@ erofs_blk_t erofs_mapbh(struct erofs_buffer_block *bb);
 bool erofs_bflush(struct erofs_buffer_block *bb);
 
 void erofs_bdrop(struct erofs_buffer_head *bh, bool tryrevoke);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

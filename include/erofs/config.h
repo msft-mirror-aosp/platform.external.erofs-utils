@@ -7,24 +7,23 @@
 #ifndef __EROFS_CONFIG_H
 #define __EROFS_CONFIG_H
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 #include "defs.h"
 #include "err.h"
 
-#ifdef HAVE_LIBSELINUX
-#include <selinux/selinux.h>
-#include <selinux/label.h>
-#endif
-
-#ifdef WITH_ANDROID
-#include <selinux/android.h>
-#include <private/android_filesystem_config.h>
-#include <private/canned_fs_config.h>
-#include <private/fs_config.h>
-#endif
 
 enum {
 	FORCE_INODE_COMPACT = 1,
 	FORCE_INODE_EXTENDED,
+};
+
+enum {
+	FORCE_INODE_BLOCK_MAP = 1,
+	FORCE_INODE_CHUNK_INDEXES,
 };
 
 enum {
@@ -51,10 +50,12 @@ struct erofs_configure {
 	/* related arguments for mkfs.erofs */
 	char *c_img_path;
 	char *c_src_path;
+	char *c_blobdev_path;
 	char *c_compress_hints_file;
 	char *c_compr_alg_master;
 	int c_compr_level_master;
-	int c_force_inodeversion;
+	char c_force_inodeversion;
+	char c_force_chunkformat;
 	/* < 0, xattr disabled and INT_MAX, always use inline xattrs */
 	int c_inline_xattr_tolerance;
 
@@ -86,6 +87,10 @@ int erofs_selabel_open(const char *file_contexts);
 static inline int erofs_selabel_open(const char *file_contexts)
 {
 	return -EINVAL;
+}
+#endif
+
+#ifdef __cplusplus
 }
 #endif
 

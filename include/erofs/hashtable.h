@@ -5,6 +5,11 @@
 #ifndef __EROFS_HASHTABLE_H
 #define __EROFS_HASHTABLE_H
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /*
  * Fast hashing routine for ints,  longs and pointers.
  * (C) 2002 Nadia Yvette Chambers, IBM
@@ -251,7 +256,7 @@ static inline u32 hash_32(u32 val, unsigned int bits)
 	return __hash_32(val) >> (32 - bits);
 }
 
-static __always_inline u32 hash_64(u64 val, unsigned int bits)
+static inline u32 hash_64(u64 val, unsigned int bits)
 {
 #if BITS_PER_LONG == 64
 	/* 64x64-bit multiply is efficient on all 64-bit processors */
@@ -379,5 +384,9 @@ static inline void hash_del(struct hlist_node *node)
  */
 #define hash_for_each_possible(name, obj, member, key)			\
 	hlist_for_each_entry(obj, &name[hash_min(key, HASH_BITS(name))], member)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

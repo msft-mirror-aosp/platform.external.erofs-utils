@@ -12,9 +12,57 @@
 #include "erofs/config.h"
 #include "erofs/print.h"
 #include "erofs/io.h"
+#include "erofs/dir.h"
 
-int erofsfuse_readdir(const char *path, void *buffer, fuse_fill_dir_t filler,
-		      off_t offset, struct fuse_file_info *fi);
+struct erofsfuse_dir_context {
+	struct erofs_dir_context ctx;
+	fuse_fill_dir_t filler;
+	struct fuse_file_info *fi;
+	void *buf;
+};
+
+static int erofsfuse_fill_dentries(struct erofs_dir_context *ctx)
+{
+	struct erofsfuse_dir_context *fusectx = (void *)ctx;
+	char dname[EROFS_NAME_LEN + 1];
+
+	strncpy(dname, ctx->dname, ctx->de_namelen);
+	dname[ctx->de_namelen] = '\0';
+	fusectx->filler(fusectx->buf, dname, NULL, 0);
+	return 0;
+}
+
+int erofsfuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+		      off_t offset, struct fuse_file_info *fi)
+{
+	int ret;
+	struct erofs_inode dir;
+	struct erofsfuse_dir_context ctx = {
+		.ctx.dir = &dir,
+		.ctx.cb = erofsfuse_fill_dentries,
+		.filler = filler,
+		.fi = fi,
+		.buf = buf,
+	};
+	erofs_dbg("readdir:%s offset=%llu", path, (long long)offset);
+
+	ret = erofs_ilookup(path, &dir);
+	if (ret)
+		return ret;
+
+	erofs_dbg("path=%s nid = %llu", path, dir.nid | 0ULL);
+	if (!S_ISDIR(dir.i_mode))
+		return -ENOTDIR;
+
+	if (!dir.i_size)
+		return 0;
+#ifdef NDEBUG
+	return erofs_iterate_dir(&ctx.ctx, false);
+#else
+	return erofs_iterate_dir(&ctx.ctx, true);
+#endif
+
+}
 
 static void *erofsfuse_init(struct fuse_conn_info *info)
 {
@@ -113,6 +161,7 @@ static struct options {
 static const struct fuse_opt option_spec[] = {
 	OPTION("--dbglevel=%u", debug_lvl),
 	OPTION("--help", show_help),
+	FUSE_OPT_KEY("--device=", 1),
 	FUSE_OPT_END
 };
 
@@ -123,6 +172,7 @@ static void usage(void)
 	fputs("usage: [options] IMAGE MOUNTPOINT\n\n"
 	      "Options:\n"
 	      "    --dbglevel=#           set output message level to # (maximum 9)\n"
+	      "    --device=#             specify an extra device to be used together\n"
 #if FUSE_MAJOR_VERSION < 3
 	      "    --help                 display this help and exit\n"
 #endif
@@ -148,7 +198,15 @@ static void erofsfuse_dumpcfg(void)
 static int optional_opt_func(void *data, const char *arg, int key,
 			     struct fuse_args *outargs)
 {
+	int ret;
+
 	switch (key) {
+	case 1:
+		ret = blob_open_ro(arg + sizeof("--device=") - 1);
+		if (ret)
+			return -1;
+		++sbi.extra_devices;
+		return 0;
 	case FUSE_OPT_KEY_NONOPT:
 		if (fusecfg.mountpoint)
 			return -1; /* Too many args */
@@ -237,6 +295,7 @@ int main(int argc, char *argv[])
 
 	ret = fuse_main(args.argc, args.argv, &erofs_ops, NULL);
 err_dev_close:
+	blob_closeall();
 	dev_close();
 err_fuse_free_args:
 	fuse_opt_free_args(&args);
