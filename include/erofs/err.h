@@ -1,16 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
+ * erofs-utils/include/erofs/err.h
+ *
  * Copyright (C) 2018 HUAWEI, Inc.
  *             http://www.huawei.com/
  * Created by Li Guifu <bluce.liguifu@huawei.com>
  */
 #ifndef __EROFS_ERR_H
 #define __EROFS_ERR_H
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
 
 #include <errno.h>
 
@@ -33,8 +30,5 @@ static inline long PTR_ERR(const void *ptr)
 	return (long) ptr;
 }
 
-#ifdef __cplusplus
-}
 #endif
 
-#endif
