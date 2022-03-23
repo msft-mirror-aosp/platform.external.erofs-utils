@@ -4,6 +4,6 @@
 aclocal && \
 autoheader && \
 autoconf && \
-case `uname` in Darwin*) glibtoolize --copy ;; \
-  *) libtoolize --copy ;; esac && \
+libtoolize && \
 automake -a -c
+
