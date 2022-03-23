@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
+ * erofs-utils/lib/exclude.c
+ *
  * Created by Li Guifu <bluce.lee@aliyun.com>
  */
 #include <string.h>
@@ -127,3 +129,4 @@ struct erofs_exclude_rule *erofs_is_exclude_path(const char *dir,
 	}
 	return NULL;
 }
+

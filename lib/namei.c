@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
+ * erofs-utils/lib/namei.c
+ *
  * Created by Li Guifu <blucerlee@gmail.com>
  */
+#include <linux/kdev_t.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <config.h>
-#if defined(HAVE_SYS_SYSMACROS_H)
 #include <sys/sysmacros.h>
-#endif
+
 #include "erofs/print.h"
 #include "erofs/io.h"
 
@@ -22,7 +23,7 @@ static dev_t erofs_new_decode_dev(u32 dev)
 	return makedev(major, minor);
 }
 
-int erofs_read_inode_from_disk(struct erofs_inode *vi)
+static int erofs_read_inode_from_disk(struct erofs_inode *vi)
 {
 	int ret, ifmt;
 	char buf[sizeof(struct erofs_inode_extended)];
@@ -30,7 +31,7 @@ int erofs_read_inode_from_disk(struct erofs_inode *vi)
 	struct erofs_inode_extended *die;
 	const erofs_off_t inode_loc = iloc(vi->nid);
 
-	ret = dev_read(0, buf, inode_loc, sizeof(*dic));
+	ret = dev_read(buf, inode_loc, sizeof(*dic));
 	if (ret < 0)
 		return -EIO;
 
@@ -47,7 +48,7 @@ int erofs_read_inode_from_disk(struct erofs_inode *vi)
 	case EROFS_INODE_LAYOUT_EXTENDED:
 		vi->inode_isize = sizeof(struct erofs_inode_extended);
 
-		ret = dev_read(0, buf + sizeof(*dic), inode_loc + sizeof(*dic),
+		ret = dev_read(buf + sizeof(*dic), inode_loc + sizeof(*dic),
 			       sizeof(*die) - sizeof(*dic));
 		if (ret < 0)
 			return -EIO;
@@ -82,9 +83,6 @@ int erofs_read_inode_from_disk(struct erofs_inode *vi)
 		vi->i_ctime = le64_to_cpu(die->i_ctime);
 		vi->i_ctime_nsec = le64_to_cpu(die->i_ctime_nsec);
 		vi->i_size = le64_to_cpu(die->i_size);
-		if (vi->datalayout == EROFS_INODE_CHUNK_BASED)
-			/* fill chunked inode summary info */
-			vi->u.chunkformat = le16_to_cpu(die->i_u.c.format);
 		break;
 	case EROFS_INODE_LAYOUT_COMPACT:
 		vi->inode_isize = sizeof(struct erofs_inode_compact);
@@ -118,8 +116,6 @@ int erofs_read_inode_from_disk(struct erofs_inode *vi)
 		vi->i_ctime_nsec = sbi.build_time_nsec;
 
 		vi->i_size = le32_to_cpu(dic->i_size);
-		if (vi->datalayout == EROFS_INODE_CHUNK_BASED)
-			vi->u.chunkformat = le16_to_cpu(dic->i_u.c.format);
 		break;
 	default:
 		erofs_err("unsupported on-disk inode version %u of nid %llu",
@@ -128,15 +124,7 @@ int erofs_read_inode_from_disk(struct erofs_inode *vi)
 	}
 
 	vi->flags = 0;
-	if (vi->datalayout == EROFS_INODE_CHUNK_BASED) {
-		if (vi->u.chunkformat & ~EROFS_CHUNK_FORMAT_ALL) {
-			erofs_err("unsupported chunk format %x of nid %llu",
-				  vi->u.chunkformat, vi->nid | 0ULL);
-			return -EOPNOTSUPP;
-		}
-		vi->u.chunkbits = LOG_BLOCK_SIZE +
-			(vi->u.chunkformat & EROFS_CHUNK_FORMAT_BLKBITS_MASK);
-	} else if (erofs_inode_is_data_compressed(vi->datalayout))
+	if (erofs_inode_is_data_compressed(vi->datalayout))
 		z_erofs_fill_inode(vi);
 	return 0;
 bogusimode:
@@ -256,8 +244,7 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 
 		name = p;
 		/* Skip until no more slashes. */
-		for (name = p; *name == '/'; ++name)
-			;
+		for (name = p; *name == '/'; ++name);
 	}
 	return 0;
 }
@@ -274,3 +261,4 @@ int erofs_ilookup(const char *path, struct erofs_inode *vi)
 	vi->nid = nd.nid;
 	return erofs_read_inode_from_disk(vi);
 }
+
