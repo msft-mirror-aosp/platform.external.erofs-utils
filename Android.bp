@@ -52,7 +52,7 @@ genrule {
 }
 
 cc_defaults {
-    name: "erofs-utils_export_defaults",
+    name: "erofs-utils_defaults",
 
     cflags: [
         "-Wall",
@@ -60,7 +60,7 @@ cc_defaults {
         "-Wno-ignored-qualifiers",
         "-Wno-pointer-arith",
         "-Wno-unused-parameter",
-        "-Wno-unused-function",
+        "-include erofs-utils-version.h",
         "-DHAVE_FALLOCATE",
         "-DHAVE_LINUX_TYPES_H",
         "-DHAVE_LIBSELINUX",
@@ -69,15 +69,6 @@ cc_defaults {
         "-DLZ4HC_ENABLED",
         "-DWITH_ANDROID",
     ],
-}
-
-cc_defaults {
-    name: "erofs-utils_defaults",
-    defaults: ["erofs-utils_export_defaults"],
-
-    cflags: [
-        "-include erofs-utils-version.h",
-    ],
     local_include_dirs: [
         "include",
     ],
@@ -85,35 +76,18 @@ cc_defaults {
         "external/e2fsprogs/lib/",
     ],
     generated_headers: ["erofs-utils-version.h"],
-    static_libs: [
-        "libbase",
+    shared_libs: [
         "libcutils",
         "libext2_uuid",
-        "liblog",
-        "liblz4",
         "libselinux",
     ],
-}
-
-cc_library {
-    host_supported: true,
-    recovery_available: true,
-    name: "liberofs",
-    defaults: ["erofs-utils_defaults"],
-    srcs: [
-        "lib/*.c",
+    static_libs: [
+        "liblz4",
     ],
-    export_include_dirs: ["include"],
-
-    target: {
-        darwin: {
-            enabled: false,
-        },
-    },
 }
 
-cc_defaults {
-    name: "mkfs-erofs_defaults",
+cc_binary_host {
+    name: "mkfs.erofs",
 
     defaults: ["erofs-utils_defaults"],
 
@@ -121,9 +95,6 @@ cc_defaults {
         "lib/*.c",
         "mkfs/*.c",
     ],
-    static_libs: [
-        "liberofs",
-    ],
 
     target: {
         darwin: {
@@ -132,51 +103,14 @@ cc_defaults {
     },
 }
 
-cc_binary {
-    name: "mkfs.erofs",
-
-    defaults: ["mkfs-erofs_defaults"],
-    host_supported: true,
-    recovery_available: true,
-}
-
-cc_binary_host {
-    name: "make_erofs",
-
-    defaults: ["mkfs-erofs_defaults"],
-}
-
-cc_binary {
-    name: "dump.erofs",
-    defaults: ["erofs-utils_defaults"],
-    host_supported: true,
-    recovery_available: true,
-    srcs: [
-        "lib/*.c",
-        "dump/*.c",
+sh_binary_host {
+    name: "mkerofsimage.sh",
+    src: "mkerofsimage.sh",
+    required: [
+        "img2simg",
+        "mkfs.erofs",
     ],
-    static_libs: [
-        "liberofs",
-    ],
-    target: {
-        darwin: {
-            enabled: false,
-        },
-    },
-}
 
-cc_binary {
-    name: "fsck.erofs",
-    defaults: ["erofs-utils_defaults"],
-    host_supported: true,
-    recovery_available: true,
-    srcs: [
-        "lib/*.c",
-        "fsck/*.c",
-    ],
-    static_libs: [
-        "liberofs",
-    ],
     target: {
         darwin: {
             enabled: false,
