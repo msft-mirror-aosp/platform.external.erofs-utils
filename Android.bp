@@ -92,14 +92,28 @@ cc_defaults {
         "external/e2fsprogs/lib/",
     ],
     generated_headers: ["erofs-utils-version.h"],
-    static_libs: [
-        "libbase",
-        "libcutils",
-        "libext2_uuid",
-        "liblog",
-        "liblz4",
-        "libselinux",
-    ],
+    target: {
+        android: {
+            shared_libs: [
+                "libbase",
+                "libcutils",
+                "libext2_uuid",
+                "liblog",
+                "liblz4",
+                "libselinux",
+            ],
+        },
+        host: {
+            static_libs: [
+                "libbase",
+                "libcutils",
+                "libext2_uuid",
+                "liblog",
+                "liblz4",
+                "libselinux",
+            ],
+        },
+    },
 }
 
 cc_library {
