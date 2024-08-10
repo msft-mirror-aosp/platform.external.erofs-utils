@@ -817,7 +817,8 @@ static const struct kite_matchfinder_cfg {
 /* 9 */ {32, 258, 258, 4096, true},	/* maximum compression */
 };
 
-static int kite_mf_init(struct kite_matchfinder *mf, int wsiz, int level)
+static int kite_mf_init(struct kite_matchfinder *mf, unsigned int wsiz,
+			int level)
 {
 	const struct kite_matchfinder_cfg *cfg;
 
@@ -859,6 +860,17 @@ static void kite_mf_reset(struct kite_matchfinder *mf,
 	 */
 	mf->base += mf->offset + kHistorySize32 + 1;
 
+	/*
+	 * Unlike other LZ encoders like liblzma [1], we simply reset the hash
+	 * chain instead of normalization.  This avoids extra complexity, as we
+	 * don't consider extreme large input buffers in one go.
+	 *
+	 * [1] https://github.com/tukaani-project/xz/blob/v5.4.0/src/liblzma/lz/lz_encoder_mf.c#L94
+	 */
+	if (__erofs_unlikely(mf->base > ((typeof(mf->base))-1) >> 1)) {
+		mf->base = kHistorySize32 + 1;
+		memset(mf->hash, 0, 0x10000 * sizeof(mf->hash[0]));
+	}
 	mf->offset = 0;
 	mf->cyclic_pos = 0;
 

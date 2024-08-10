@@ -96,6 +96,14 @@ AC_DEFUN([EROFS_UTILS_PARSE_DIRECTORY],
 
 AC_ARG_VAR([MAX_BLOCK_SIZE], [The maximum block size which erofs-utils supports])
 
+AC_MSG_CHECKING([whether to enable multi-threading support])
+AC_ARG_ENABLE([multithreading],
+    AS_HELP_STRING([--enable-multithreading],
+                   [enable multi-threading support (EXPERIMENTAL) @<:@default=no@:>@]),
+    [enable_multithreading="$enableval"],
+    [enable_multithreading="no"])
+AC_MSG_RESULT([$enable_multithreading])
+
 AC_ARG_ENABLE([debug],
     [AS_HELP_STRING([--enable-debug],
                     [enable debugging mode @<:@default=no@:>@])],
@@ -119,21 +127,36 @@ AC_ARG_ENABLE(lz4,
    [enable_lz4="$enableval"], [enable_lz4="yes"])
 
 AC_ARG_ENABLE(lzma,
-   [AS_HELP_STRING([--enable-lzma], [enable LZMA compression support @<:@default=no@:>@])],
-   [enable_lzma="$enableval"], [enable_lzma="no"])
+   [AS_HELP_STRING([--disable-lzma], [disable LZMA compression support @<:@default=auto@:>@])],
+   [enable_lzma="$enableval"])
 
 AC_ARG_WITH(zlib,
    [AS_HELP_STRING([--without-zlib],
-      [Ignore presence of zlib inflate support @<:@default=enabled@:>@])])
+      [Ignore presence of zlib inflate support @<:@default=auto@:>@])])
 
 AC_ARG_WITH(libdeflate,
    [AS_HELP_STRING([--with-libdeflate],
       [Enable and build with libdeflate inflate support @<:@default=disabled@:>@])], [],
       [with_libdeflate="no"])
 
+AC_ARG_WITH(libzstd,
+   [AS_HELP_STRING([--with-libzstd],
+      [Enable and build with of libzstd support @<:@default=auto@:>@])])
+
+AC_ARG_WITH(qpl,
+   [AS_HELP_STRING([--with-qpl],
+      [Enable and build with Intel QPL support @<:@default=disabled@:>@])], [],
+      [with_qpl="no"])
+
 AC_ARG_ENABLE(fuse,
    [AS_HELP_STRING([--enable-fuse], [enable erofsfuse @<:@default=no@:>@])],
    [enable_fuse="$enableval"], [enable_fuse="no"])
+
+AC_ARG_ENABLE([static-fuse],
+    [AS_HELP_STRING([--enable-static-fuse],
+                    [build erofsfuse as a static library @<:@default=no@:>@])],
+    [enable_static_fuse="$enableval"],
+    [enable_static_fuse="no"])
 
 AC_ARG_WITH(uuid,
    [AS_HELP_STRING([--without-uuid],
@@ -161,14 +184,6 @@ AC_ARG_WITH(lz4-libdir,
 AC_ARG_VAR([LZ4_CFLAGS], [C compiler flags for lz4])
 AC_ARG_VAR([LZ4_LIBS], [linker flags for lz4])
 
-AC_ARG_WITH(liblzma-incdir,
-   [AS_HELP_STRING([--with-liblzma-incdir=DIR], [liblzma include directory])], [
-   EROFS_UTILS_PARSE_DIRECTORY(["$withval"],[withval])])
-
-AC_ARG_WITH(liblzma-libdir,
-   [AS_HELP_STRING([--with-liblzma-libdir=DIR], [liblzma lib directory])], [
-   EROFS_UTILS_PARSE_DIRECTORY(["$withval"],[withval])])
-
 # Checks for header files.
 AC_CHECK_HEADERS(m4_flatten([
 	dirent.h
@@ -189,6 +204,7 @@ AC_CHECK_HEADERS(m4_flatten([
 	sys/ioctl.h
 	sys/mman.h
 	sys/random.h
+	sys/sendfile.h
 	sys/stat.h
 	sys/statfs.h
 	sys/sysmacros.h
@@ -252,10 +268,12 @@ AC_CHECK_FUNCS(m4_flatten([
 	pwrite64
 	posix_fadvise
 	fstatfs
+	sendfile
 	strdup
 	strerror
 	strrchr
 	strtoull
+	sysconf
 	tmpfile64
 	utimensat]))
 
@@ -287,6 +305,14 @@ AS_IF([test "x$MAX_BLOCK_SIZE" = "x"], [
                              [erofs_cv_max_block_size=4096],
                              [erofs_cv_max_block_size=4096]))
 ], [erofs_cv_max_block_size=$MAX_BLOCK_SIZE])
+
+# Configure multi-threading support
+AS_IF([test "x$enable_multithreading" != "xno"], [
+  AC_CHECK_HEADERS([pthread.h])
+  AC_CHECK_LIB([pthread], [pthread_mutex_lock], [],
+    AC_MSG_ERROR([libpthread is required for multi-threaded build]))
+  AC_DEFINE(EROFS_MT_ENABLED, 1, [Enable multi-threading support])
+], [])
 
 # Configure debug mode
 AS_IF([test "x$enable_debug" != "xno"], [], [
@@ -339,15 +365,32 @@ AS_IF([test "x$with_selinux" != "xno"], [
 
 # Configure fuse
 AS_IF([test "x$enable_fuse" != "xno"], [
-  PKG_CHECK_MODULES([libfuse], [fuse >= 2.6])
   # Paranoia: don't trust the result reported by pkgconfig before trying out
   saved_LIBS="$LIBS"
   saved_CPPFLAGS=${CPPFLAGS}
-  CPPFLAGS="${libfuse_CFLAGS} ${CPPFLAGS}"
-  LIBS="${libfuse_LIBS} $LIBS"
-  AC_CHECK_LIB(fuse, fuse_main, [
-    have_fuse="yes" ], [
-    AC_MSG_ERROR([libfuse (>= 2.6) doesn't work properly])])
+  PKG_CHECK_MODULES([libfuse3], [fuse3 >= 3.0], [
+    PKG_CHECK_MODULES([libfuse3_0], [fuse3 >= 3.0 fuse3 < 3.2], [
+      AC_DEFINE([FUSE_USE_VERSION], [30], [used FUSE API version])
+    ], [
+      PKG_CHECK_MODULES([libfuse3_2], [fuse3 >= 3.2], [
+        AC_DEFINE([FUSE_USE_VERSION], [32], [used FUSE API version])
+      ])
+    ])
+    CPPFLAGS="${libfuse3_CFLAGS} ${CPPFLAGS}"
+    LIBS="${libfuse3_LIBS} $LIBS"
+    AC_CHECK_LIB(fuse3, fuse_session_new, [], [
+    AC_MSG_ERROR([libfuse3 (>= 3.0) doesn't work properly for lowlevel api])])
+    have_fuse="yes"
+  ], [
+    PKG_CHECK_MODULES([libfuse2], [fuse >= 2.6], [
+      AC_DEFINE([FUSE_USE_VERSION], [26], [used FUSE API version])
+      CPPFLAGS="${libfuse2_CFLAGS} ${CPPFLAGS}"
+      LIBS="${libfuse2_LIBS} $LIBS"
+      AC_CHECK_LIB(fuse, fuse_lowlevel_new, [], [
+        AC_MSG_ERROR([libfuse (>= 2.6) doesn't work properly for lowlevel api])])
+      have_fuse="yes"
+    ], [have_fuse="no"])
+  ])
   LIBS="${saved_LIBS}"
   CPPFLAGS="${saved_CPPFLAGS}"], [have_fuse="no"])
 
@@ -383,44 +426,56 @@ if test "x$enable_lz4" = "xyes"; then
   CPPFLAGS=${saved_CPPFLAGS}
 fi
 
-if test "x$enable_lzma" = "xyes"; then
+# Configure liblzma
+have_liblzma="no"
+AS_IF([test "x$enable_lzma" != "xno"], [
   saved_CPPFLAGS=${CPPFLAGS}
-  test -z "${with_liblzma_incdir}" ||
-    CPPFLAGS="-I$with_liblzma_incdir $CPPFLAGS"
-  AC_CHECK_HEADERS([lzma.h],[have_lzmah="yes"], [])
-
-  if test "x${have_lzmah}" = "xyes" ; then
+  PKG_CHECK_MODULES([liblzma], [liblzma], [
+    # Paranoia: don't trust the result reported by pkgconfig before trying out
     saved_LIBS="$LIBS"
-    saved_LDFLAGS="$LDFLAGS"
-
-    test -z "${with_liblzma_libdir}" ||
-      LDFLAGS="-L$with_liblzma_libdir ${LDFLAGS}"
-    AC_CHECK_LIB(lzma, lzma_microlzma_encoder, [],
-      [AC_MSG_ERROR([Cannot find proper liblzma])])
-
-    AC_CHECK_DECL(lzma_microlzma_encoder, [have_liblzma="yes"],
-      [AC_MSG_ERROR([Cannot find proper liblzma])], [[
+    saved_CPPFLAGS=${CPPFLAGS}
+    CPPFLAGS="${liblzma_CFLAGS} ${CPPFLAGS}"
+    LIBS="${liblzma_LIBS} $LIBS"
+    AC_CHECK_HEADERS([lzma.h],[
+      AC_CHECK_LIB(lzma, lzma_microlzma_encoder, [
+        AC_CHECK_DECL(lzma_microlzma_encoder, [have_liblzma="yes"],
+          [], [[
 #include <lzma.h>
-    ]])
-    LDFLAGS="${saved_LDFLAGS}"
+        ]])
+      ])
+    ])
     LIBS="${saved_LIBS}"
-  fi
-  CPPFLAGS="${saved_CPPFLAGS}"
-fi
+    CPPFLAGS="${saved_CPPFLAGS}"
+  ], [[]])
+  AS_IF([test "x$enable_lzma" = "xyes" -a "x$have_liblzma" != "xyes"], [
+    AC_MSG_ERROR([Cannot find a proper liblzma version])
+  ])
+])
 
 # Configure zlib
+have_zlib="no"
 AS_IF([test "x$with_zlib" != "xno"], [
-  PKG_CHECK_MODULES([zlib], [zlib])
-  # Paranoia: don't trust the result reported by pkgconfig before trying out
-  saved_LIBS="$LIBS"
-  saved_CPPFLAGS=${CPPFLAGS}
-  CPPFLAGS="${zlib_CFLAGS} ${CPPFLAGS}"
-  LIBS="${zlib_LIBS} $LIBS"
-  AC_CHECK_LIB(z, inflate, [
-    have_zlib="yes" ], [
-    AC_MSG_ERROR([zlib doesn't work properly])])
-  LIBS="${saved_LIBS}"
-  CPPFLAGS="${saved_CPPFLAGS}"], [have_zlib="no"])
+  PKG_CHECK_MODULES([zlib], [zlib], [
+    # Paranoia: don't trust the result reported by pkgconfig before trying out
+    saved_LIBS="$LIBS"
+    saved_CPPFLAGS=${CPPFLAGS}
+    CPPFLAGS="${zlib_CFLAGS} ${CPPFLAGS}"
+    LIBS="${zlib_LIBS} $LIBS"
+    AC_CHECK_HEADERS([zlib.h],[
+      AC_CHECK_LIB(z, inflate, [], [
+        AC_MSG_ERROR([zlib doesn't work properly])])
+      AC_CHECK_DECL(inflate, [have_zlib="yes"],
+        [AC_MSG_ERROR([zlib doesn't work properly])], [[
+#include <zlib.h>
+      ]])
+    ])
+    LIBS="${saved_LIBS}"
+    CPPFLAGS="${saved_CPPFLAGS}"], [
+    AS_IF([test "x$with_zlib" = "xyes"], [
+      AC_MSG_ERROR([Cannot find proper zlib])
+    ])
+  ])
+])
 
 # Configure libdeflate
 AS_IF([test "x$with_libdeflate" != "xno"], [
@@ -436,6 +491,57 @@ AS_IF([test "x$with_libdeflate" != "xno"], [
   LIBS="${saved_LIBS}"
   CPPFLAGS="${saved_CPPFLAGS}"], [have_libdeflate="no"])
 
+# Configure libzstd
+have_libzstd="no"
+AS_IF([test "x$with_libzstd" != "xno"], [
+  PKG_CHECK_MODULES([libzstd], [libzstd >= 1.4.0], [
+    # Paranoia: don't trust the result reported by pkgconfig before trying out
+    saved_LIBS="$LIBS"
+    saved_CPPFLAGS=${CPPFLAGS}
+    CPPFLAGS="${libzstd_CFLAGS} ${CPPFLAGS}"
+    LIBS="${libzstd_LIBS} $LIBS"
+    AC_CHECK_HEADERS([zstd.h],[
+      AC_CHECK_LIB(zstd, ZSTD_compress2, [], [
+        AC_MSG_ERROR([libzstd doesn't work properly])])
+      AC_CHECK_DECL(ZSTD_compress2, [have_libzstd="yes"],
+        [AC_MSG_ERROR([libzstd doesn't work properly])], [[
+#include <zstd.h>
+      ]])
+      AC_CHECK_FUNCS([ZSTD_getFrameContentSize])
+    ])
+    LIBS="${saved_LIBS}"
+    CPPFLAGS="${saved_CPPFLAGS}"], [
+    AS_IF([test "x$with_libzstd" = "xyes"], [
+      AC_MSG_ERROR([Cannot find proper libzstd])
+    ])
+  ])
+])
+
+# Configure Intel QPL
+have_qpl="no"
+AS_IF([test "x$with_qpl" != "xno"], [
+  PKG_CHECK_MODULES([libqpl], [qpl >= 1.5.0], [
+    # Paranoia: don't trust the result reported by pkgconfig before trying out
+    saved_LIBS="$LIBS"
+    saved_CPPFLAGS=${CPPFLAGS}
+    CPPFLAGS="${libqpl_CFLAGS} ${CPPFLAGS}"
+    LIBS="${libqpl_LIBS} $LIBS"
+    AC_CHECK_HEADERS([qpl/qpl.h],[
+      AC_CHECK_LIB(qpl, qpl_execute_job, [], [
+        AC_MSG_ERROR([libqpl doesn't work properly])])
+      AC_CHECK_DECL(qpl_execute_job, [have_qpl="yes"],
+        [AC_MSG_ERROR([libqpl doesn't work properly])], [[
+#include <qpl/qpl.h>
+      ]])
+    ])
+    LIBS="${saved_LIBS}"
+    CPPFLAGS="${saved_CPPFLAGS}"], [
+    AS_IF([test "x$with_qpl" = "xyes"], [
+      AC_MSG_ERROR([Cannot find proper libqpl])
+    ])
+  ])
+])
+
 # Enable 64-bit off_t
 CFLAGS+=" -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"
 
@@ -450,11 +556,15 @@ AS_IF([test "x$enable_fuzzing" != "xyes"], [], [
 AM_CONDITIONAL([ENABLE_FUZZING], [test "x${enable_fuzzing}" = "xyes"])
 
 # Set up needed symbols, conditionals and compiler/linker flags
+AM_CONDITIONAL([ENABLE_EROFS_MT], [test "x${enable_multithreading}" != "xno"])
 AM_CONDITIONAL([ENABLE_LZ4], [test "x${have_lz4}" = "xyes"])
 AM_CONDITIONAL([ENABLE_LZ4HC], [test "x${have_lz4hc}" = "xyes"])
 AM_CONDITIONAL([ENABLE_FUSE], [test "x${have_fuse}" = "xyes"])
 AM_CONDITIONAL([ENABLE_LIBLZMA], [test "x${have_liblzma}" = "xyes"])
 AM_CONDITIONAL([ENABLE_LIBDEFLATE], [test "x${have_libdeflate}" = "xyes"])
+AM_CONDITIONAL([ENABLE_LIBZSTD], [test "x${have_libzstd}" = "xyes"])
+AM_CONDITIONAL([ENABLE_QPL], [test "x${have_qpl}" = "xyes"])
+AM_CONDITIONAL([ENABLE_STATIC_FUSE], [test "x${enable_static_fuse}" = "xyes"])
 
 if test "x$have_uuid" = "xyes"; then
   AC_DEFINE([HAVE_LIBUUID], 1, [Define to 1 if libuuid is found])
@@ -498,6 +608,16 @@ fi
 
 if test "x$have_libdeflate" = "xyes"; then
   AC_DEFINE([HAVE_LIBDEFLATE], 1, [Define to 1 if libdeflate is found])
+fi
+
+if test "x$have_libzstd" = "xyes"; then
+  AC_DEFINE([HAVE_LIBZSTD], 1, [Define to 1 if libzstd is found])
+fi
+
+if test "x$have_qpl" = "xyes"; then
+  AC_DEFINE([HAVE_QPL], 1, [Define to 1 if qpl is found])
+  AC_SUBST([libqpl_LIBS])
+  AC_SUBST([libqpl_CFLAGS])
 fi
 
 # Dump maximum block size

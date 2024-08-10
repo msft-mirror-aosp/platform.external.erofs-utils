@@ -2,22 +2,13 @@
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
- * Created by Gao Xiang <gaoxiang25@huawei.com>
+ * Created by Gao Xiang <xiang@kernel.org>
  */
 #include "erofs/internal.h"
 #include "compressor.h"
 #include "erofs/print.h"
 
-#define EROFS_CONFIG_COMPR_DEF_BOUNDARY		(128)
-
-static const struct erofs_algorithm {
-	char *name;
-	const struct erofs_compressor *c;
-	unsigned int id;
-
-	/* its name won't be shown as a supported algorithm */
-	bool optimisor;
-} erofs_algs[] = {
+static const struct erofs_algorithm erofs_algs[] = {
 	{ "lz4",
 #if LZ4_ENABLED
 		&erofs_compressor_lz4,
@@ -46,6 +37,14 @@ static const struct erofs_algorithm {
 	{ "libdeflate", &erofs_compressor_libdeflate,
 	  Z_EROFS_COMPRESSION_DEFLATE, true },
 #endif
+
+	{ "zstd",
+#ifdef HAVE_LIBZSTD
+		&erofs_compressor_libzstd,
+#else
+		NULL,
+#endif
+	  Z_EROFS_COMPRESSION_ZSTD, false },
 };
 
 int z_erofs_get_compress_algorithm_id(const struct erofs_compress *c)
@@ -65,59 +64,29 @@ const char *z_erofs_list_supported_algorithms(int i, unsigned int *mask)
 	return "";
 }
 
-const char *z_erofs_list_available_compressors(int *i)
+const struct erofs_algorithm *z_erofs_list_available_compressors(int *i)
 {
 	for (;*i < ARRAY_SIZE(erofs_algs); ++*i) {
 		if (!erofs_algs[*i].c)
 			continue;
-		return erofs_algs[(*i)++].name;
+		return &erofs_algs[(*i)++];
 	}
 	return NULL;
 }
 
 int erofs_compress_destsize(const struct erofs_compress *c,
 			    const void *src, unsigned int *srcsize,
-			    void *dst, unsigned int dstsize, bool inblocks)
+			    void *dst, unsigned int dstsize)
 {
-	unsigned int uncompressed_capacity, compressed_size;
-	int ret;
-
 	DBG_BUGON(!c->alg);
 	if (!c->alg->c->compress_destsize)
-		return -ENOTSUP;
+		return -EOPNOTSUPP;
 
-	uncompressed_capacity = *srcsize;
-	ret = c->alg->c->compress_destsize(c, src, srcsize, dst, dstsize);
-	if (ret < 0)
-		return ret;
-
-	/* XXX: ret >= destsize_alignsize is a temporary hack for ztailpacking */
-	if (inblocks || ret >= c->destsize_alignsize ||
-	    uncompressed_capacity != *srcsize)
-		compressed_size = roundup(ret, c->destsize_alignsize);
-	else
-		compressed_size = ret;
-	DBG_BUGON(c->compress_threshold < 100);
-	/* check if there is enough gains to compress */
-	if (*srcsize <= compressed_size * c->compress_threshold / 100)
-		return -EAGAIN;
-	return ret;
+	return c->alg->c->compress_destsize(c, src, srcsize, dst, dstsize);
 }
 
-int erofs_compressor_setlevel(struct erofs_compress *c, int compression_level)
-{
-	DBG_BUGON(!c->alg);
-	if (c->alg->c->setlevel)
-		return c->alg->c->setlevel(c, compression_level);
-
-	if (compression_level >= 0)
-		return -EINVAL;
-	c->compression_level = 0;
-	return 0;
-}
-
-int erofs_compressor_init(struct erofs_sb_info *sbi,
-			  struct erofs_compress *c, char *alg_name)
+int erofs_compressor_init(struct erofs_sb_info *sbi, struct erofs_compress *c,
+			  char *alg_name, int compression_level, u32 dict_size)
 {
 	int ret, i;
 
@@ -125,11 +94,8 @@ int erofs_compressor_init(struct erofs_sb_info *sbi,
 
 	/* should be written in "minimum compression ratio * 100" */
 	c->compress_threshold = 100;
-
-	/* optimize for 4k size page */
-	c->destsize_alignsize = erofs_blksiz(sbi);
-	c->destsize_redzone_begin = erofs_blksiz(sbi) - 16;
-	c->destsize_redzone_end = EROFS_CONFIG_COMPR_DEF_BOUNDARY;
+	c->compression_level = -1;
+	c->dict_size = 0;
 
 	if (!alg_name) {
 		c->alg = NULL;
@@ -144,7 +110,36 @@ int erofs_compressor_init(struct erofs_sb_info *sbi,
 		if (!erofs_algs[i].c)
 			continue;
 
+		if (erofs_algs[i].c->setlevel) {
+			ret = erofs_algs[i].c->setlevel(c, compression_level);
+			if (ret) {
+				erofs_err("failed to set compression level %d for %s",
+					  compression_level, alg_name);
+				return ret;
+			}
+		} else if (compression_level >= 0) {
+			erofs_err("compression level %d is not supported for %s",
+				  compression_level, alg_name);
+			return -EINVAL;
+		}
+
+		if (erofs_algs[i].c->setdictsize) {
+			ret = erofs_algs[i].c->setdictsize(c, dict_size);
+			if (ret) {
+				erofs_err("failed to set dict size %u for %s",
+					  dict_size, alg_name);
+				return ret;
+			}
+		} else if (dict_size) {
+			erofs_err("dict size is not supported for %s",
+				  alg_name);
+			return -EINVAL;
+		}
+
 		ret = erofs_algs[i].c->init(c);
+		if (ret)
+			return ret;
+
 		if (!ret) {
 			c->alg = &erofs_algs[i];
 			return 0;
@@ -159,4 +154,10 @@ int erofs_compressor_exit(struct erofs_compress *c)
 	if (c->alg && c->alg->c->exit)
 		return c->alg->c->exit(c);
 	return 0;
+}
+
+void erofs_compressor_reset(struct erofs_compress *c)
+{
+	if (c->alg && c->alg->c->reset)
+		c->alg->c->reset(c);
 }

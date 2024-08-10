@@ -10,10 +10,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "erofs/print.h"
-#include "erofs/io.h"
 #include "erofs/compress.h"
 #include "erofs/decompress.h"
 #include "erofs/dir.h"
+#include "../lib/compressor.h"
 
 static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid);
 
@@ -35,7 +35,8 @@ struct erofsfsck_cfg {
 static struct erofsfsck_cfg fsckcfg;
 
 static struct option long_options[] = {
-	{"help", no_argument, 0, 1},
+	{"version", no_argument, 0, 'V'},
+	{"help", no_argument, 0, 'h'},
 	{"extract", optional_argument, 0, 2},
 	{"device", required_argument, 0, 3},
 	{"force", no_argument, 0, 4},
@@ -46,6 +47,7 @@ static struct option long_options[] = {
 	{"no-preserve", no_argument, 0, 9},
 	{"no-preserve-owner", no_argument, 0, 10},
 	{"no-preserve-perms", no_argument, 0, 11},
+	{"offset", required_argument, 0, 12},
 	{0, 0, 0, 0},
 };
 
@@ -63,53 +65,70 @@ static void print_available_decompressors(FILE *f, const char *delim)
 {
 	int i = 0;
 	bool comma = false;
-	const char *s;
+	const struct erofs_algorithm *s;
 
 	while ((s = z_erofs_list_available_compressors(&i)) != NULL) {
 		if (comma)
 			fputs(delim, f);
-		fputs(s, f);
+		fputs(s->name, f);
 		comma = true;
 	}
 	fputc('\n', f);
 }
 
-static void usage(void)
+static void usage(int argc, char **argv)
 {
-	fputs("usage: [options] IMAGE\n\n"
-	      "Check erofs filesystem compatibility and integrity of IMAGE, and [options] are:\n"
-	      " -V                     print the version number of fsck.erofs and exit\n"
-	      " -d#                    set output message level to # (maximum 9)\n"
-	      " -p                     print total compression ratio of all files\n"
-	      " --device=X             specify an extra device to be used together\n"
-	      " --extract[=X]          check if all files are well encoded, optionally extract to X\n"
-	      " --help                 display this help and exit\n"
-	      "\nExtraction options (--extract=X is required):\n"
-	      " --force                allow extracting to root\n"
-	      " --overwrite            overwrite files that already exist\n"
-	      " --preserve             extract with the same ownership and permissions as on the filesystem\n"
-	      "                        (default for superuser)\n"
-	      " --preserve-owner       extract with the same ownership as on the filesystem\n"
-	      " --preserve-perms       extract with the same permissions as on the filesystem\n"
-	      " --no-preserve          extract as yourself and apply user's umask on permissions\n"
-	      "                        (default for ordinary users)\n"
-	      " --no-preserve-owner    extract as yourself\n"
-	      " --no-preserve-perms    apply user's umask when extracting permissions\n"
-	      "\nSupported algorithms are: ", stderr);
-	print_available_decompressors(stderr, ", ");
+	//	"         1         2         3         4         5         6         7         8  "
+	//	"12345678901234567890123456789012345678901234567890123456789012345678901234567890\n"
+	printf(
+		"Usage: %s [OPTIONS] IMAGE\n"
+		"Check erofs filesystem compatibility and integrity of IMAGE.\n"
+		"\n"
+		"This version of fsck.erofs is capable of checking images that use any of the\n"
+		"following algorithms: ", argv[0]);
+	print_available_decompressors(stdout, ", ");
+	printf("\n"
+		"General options:\n"
+		" -V, --version          print the version number of fsck.erofs and exit\n"
+		" -h, --help             display this help and exit\n"
+		"\n"
+		" -d<0-9>                set output verbosity; 0=quiet, 9=verbose (default=%i)\n"
+		" -p                     print total compression ratio of all files\n"
+		" --device=X             specify an extra device to be used together\n"
+		" --extract[=X]          check if all files are well encoded, optionally\n"
+		"                        extract to X\n"
+		" --offset=#             skip # bytes at the beginning of IMAGE\n"
+		"\n"
+		" -a, -A, -y             no-op, for compatibility with fsck of other filesystems\n"
+		"\n"
+		"Extraction options (--extract=X is required):\n"
+		" --force                allow extracting to root\n"
+		" --overwrite            overwrite files that already exist\n"
+		" --[no-]preserve        same as --[no-]preserve-owner --[no-]preserve-perms\n"
+		" --[no-]preserve-owner  whether to preserve the ownership from the\n"
+		"                        filesystem (default for superuser), or to extract as\n"
+		"                        yourself (default for ordinary users)\n"
+		" --[no-]preserve-perms  whether to preserve the exact permissions from the\n"
+		"                        filesystem without applying umask (default for\n"
+		"                        superuser), or to modify the permissions by applying\n"
+		"                        umask (default for ordinary users)\n",
+		EROFS_WARN);
 }
 
 static void erofsfsck_print_version(void)
 {
-	printf("fsck.erofs %s\n", cfg.c_version);
+	printf("fsck.erofs (erofs-utils) %s\navailable decompressors: ",
+	       cfg.c_version);
+	print_available_decompressors(stdout, ", ");
 }
 
 static int erofsfsck_parse_options_cfg(int argc, char **argv)
 {
+	char *endptr;
 	int opt, ret;
 	bool has_opt_preserve = false;
 
-	while ((opt = getopt_long(argc, argv, "Vd:p",
+	while ((opt = getopt_long(argc, argv, "Vd:phaAy",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'V':
@@ -126,9 +145,13 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 		case 'p':
 			fsckcfg.print_comp_ratio = true;
 			break;
-		case 1:
-			usage();
+		case 'h':
+			usage(argc, argv);
 			exit(0);
+		case 'a':
+		case 'A':
+		case 'y':
+			break;
 		case 2:
 			fsckcfg.check_decomp = true;
 			if (optarg) {
@@ -160,10 +183,10 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 			}
 			break;
 		case 3:
-			ret = blob_open_ro(&sbi, optarg);
+			ret = erofs_blob_open_ro(&g_sbi, optarg);
 			if (ret)
 				return ret;
-			++sbi.extra_devices;
+			++g_sbi.extra_devices;
 			break;
 		case 4:
 			fsckcfg.force = true;
@@ -194,6 +217,13 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 		case 11:
 			fsckcfg.preserve_perms = false;
 			has_opt_preserve = true;
+			break;
+		case 12:
+			g_sbi.bdev.offset = strtoull(optarg, &endptr, 0);
+			if (*endptr != '\0') {
+				erofs_err("invalid disk offset %s", optarg);
+				return -EINVAL;
+			}
 			break;
 		default:
 			return -EINVAL;
@@ -281,7 +311,7 @@ static int erofs_check_sb_chksum(void)
 	struct erofs_super_block *sb;
 	int ret;
 
-	ret = blk_read(&sbi, 0, buf, 0, 1);
+	ret = erofs_blk_read(&g_sbi, 0, buf, 0, 1);
 	if (ret) {
 		erofs_err("failed to read superblock to check checksum: %d",
 			  ret);
@@ -291,10 +321,10 @@ static int erofs_check_sb_chksum(void)
 	sb = (struct erofs_super_block *)(buf + EROFS_SUPER_OFFSET);
 	sb->checksum = 0;
 
-	crc = erofs_crc32c(~0, (u8 *)sb, erofs_blksiz(&sbi) - EROFS_SUPER_OFFSET);
-	if (crc != sbi.checksum) {
+	crc = erofs_crc32c(~0, (u8 *)sb, erofs_blksiz(&g_sbi) - EROFS_SUPER_OFFSET);
+	if (crc != g_sbi.checksum) {
 		erofs_err("superblock chksum doesn't match: saved(%08xh) calculated(%08xh)",
-			  sbi.checksum, crc);
+			  g_sbi.checksum, crc);
 		fsckcfg.corrupted = true;
 		return -1;
 	}
@@ -329,7 +359,7 @@ static int erofs_verify_xattr(struct erofs_inode *inode)
 	}
 
 	addr = erofs_iloc(inode) + inode->inode_isize;
-	ret = dev_read(sbi, 0, buf, addr, xattr_hdr_size);
+	ret = erofs_dev_read(sbi, 0, buf, addr, xattr_hdr_size);
 	if (ret < 0) {
 		erofs_err("failed to read xattr header @ nid %llu: %d",
 			  inode->nid | 0ULL, ret);
@@ -359,7 +389,7 @@ static int erofs_verify_xattr(struct erofs_inode *inode)
 	while (remaining > 0) {
 		unsigned int entry_sz;
 
-		ret = dev_read(sbi, 0, buf, addr, xattr_entry_size);
+		ret = erofs_dev_read(sbi, 0, buf, addr, xattr_entry_size);
 		if (ret) {
 			erofs_err("failed to read xattr entry @ nid %llu: %d",
 				  inode->nid | 0ULL, ret);
@@ -439,8 +469,17 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 		pos += map.m_llen;
 
 		/* should skip decomp? */
-		if (!(map.m_flags & EROFS_MAP_MAPPED) || !fsckcfg.check_decomp)
+		if (map.m_la >= inode->i_size || !fsckcfg.check_decomp)
 			continue;
+
+		if (outfd >= 0 && !(map.m_flags & EROFS_MAP_MAPPED)) {
+			ret = lseek(outfd, map.m_llen, SEEK_CUR);
+			if (ret < 0) {
+				ret = -errno;
+				goto out;
+			}
+			continue;
+		}
 
 		if (map.m_plen > Z_EROFS_PCLUSTER_MAX_SIZE) {
 			if (compressed) {
@@ -468,9 +507,15 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 
 		if (compressed) {
 			if (map.m_llen > buffer_size) {
+				char *newbuffer;
+
 				buffer_size = map.m_llen;
-				buffer = realloc(buffer, buffer_size);
-				BUG_ON(!buffer);
+				newbuffer = realloc(buffer, buffer_size);
+				if (!newbuffer) {
+					ret = -ENOMEM;
+					goto out;
+				}
+				buffer = newbuffer;
 			}
 			ret = z_erofs_read_one_data(inode, &map, raw, buffer,
 						    0, map.m_llen, false);
@@ -657,11 +702,7 @@ again:
 
 	/* verify data chunk layout */
 	ret = erofs_verify_inode_data(inode, fd);
-	if (ret)
-		return ret;
-
-	if (close(fd))
-		return -errno;
+	close(fd);
 	return ret;
 }
 
@@ -850,7 +891,7 @@ static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid)
 	erofs_dbg("check inode: nid(%llu)", nid | 0ULL);
 
 	inode.nid = nid;
-	inode.sbi = &sbi;
+	inode.sbi = &g_sbi;
 	ret = erofs_read_inode_from_disk(&inode);
 	if (ret) {
 		if (ret == -EIO)
@@ -918,7 +959,7 @@ int main(int argc, char *argv[])
 	err = erofsfsck_parse_options_cfg(argc, argv);
 	if (err) {
 		if (err == -EINVAL)
-			usage();
+			fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
 		goto exit;
 	}
 
@@ -926,19 +967,19 @@ int main(int argc, char *argv[])
 	cfg.c_dbg_lvl = -1;
 #endif
 
-	err = dev_open_ro(&sbi, cfg.c_img_path);
+	err = erofs_dev_open(&g_sbi, cfg.c_img_path, O_RDONLY);
 	if (err) {
 		erofs_err("failed to open image file");
 		goto exit;
 	}
 
-	err = erofs_read_superblock(&sbi);
+	err = erofs_read_superblock(&g_sbi);
 	if (err) {
 		erofs_err("failed to read superblock");
 		goto exit_dev_close;
 	}
 
-	if (erofs_sb_has_sb_chksum(&sbi) && erofs_check_sb_chksum()) {
+	if (erofs_sb_has_sb_chksum(&g_sbi) && erofs_check_sb_chksum()) {
 		erofs_err("failed to verify superblock checksum");
 		goto exit_put_super;
 	}
@@ -946,15 +987,15 @@ int main(int argc, char *argv[])
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_init();
 
-	if (erofs_sb_has_fragments(&sbi) && sbi.packed_nid > 0) {
-		err = erofsfsck_check_inode(sbi.packed_nid, sbi.packed_nid);
+	if (erofs_sb_has_fragments(&g_sbi) && g_sbi.packed_nid > 0) {
+		err = erofsfsck_check_inode(g_sbi.packed_nid, g_sbi.packed_nid);
 		if (err) {
 			erofs_err("failed to verify packed file");
 			goto exit_hardlink;
 		}
 	}
 
-	err = erofsfsck_check_inode(sbi.root_nid, sbi.root_nid);
+	err = erofsfsck_check_inode(g_sbi.root_nid, g_sbi.root_nid);
 	if (fsckcfg.corrupted) {
 		if (!fsckcfg.extract_path)
 			erofs_err("Found some filesystem corruption");
@@ -980,11 +1021,11 @@ exit_hardlink:
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_exit();
 exit_put_super:
-	erofs_put_super(&sbi);
+	erofs_put_super(&g_sbi);
 exit_dev_close:
-	dev_close(&sbi);
+	erofs_dev_close(&g_sbi);
 exit:
-	blob_closeall(&sbi);
+	erofs_blob_closeall(&g_sbi);
 	erofs_exit_configure();
 	return err ? 1 : 0;
 }

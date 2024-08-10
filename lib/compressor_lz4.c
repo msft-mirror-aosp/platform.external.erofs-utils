@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
- * Created by Gao Xiang <gaoxiang25@huawei.com>
+ * Created by Gao Xiang <xiang@kernel.org>
  */
 #include <lz4.h>
 #include "erofs/internal.h"
@@ -32,13 +32,12 @@ static int compressor_lz4_exit(struct erofs_compress *c)
 
 static int compressor_lz4_init(struct erofs_compress *c)
 {
-	c->sbi->lz4_max_distance = LZ4_DISTANCE_MAX;
+	c->sbi->lz4.max_distance = max_t(u16, c->sbi->lz4.max_distance,
+					 LZ4_DISTANCE_MAX);
 	return 0;
 }
 
 const struct erofs_compressor erofs_compressor_lz4 = {
-	.default_level = 0,
-	.best_level = 0,
 	.init = compressor_lz4_init,
 	.exit = compressor_lz4_exit,
 	.compress_destsize = lz4_compress_destsize,

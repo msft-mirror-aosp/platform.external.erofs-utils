@@ -26,27 +26,42 @@ struct erofs_pax_header {
 
 #define EROFS_IOS_DECODER_NONE		0
 #define EROFS_IOS_DECODER_GZIP		1
+#define EROFS_IOS_DECODER_LIBLZMA	2
+
+#ifdef HAVE_LIBLZMA
+#include <lzma.h>
+struct erofs_iostream_liblzma {
+	u8 inbuf[32768];
+	lzma_stream strm;
+	int fd;
+};
+#endif
 
 struct erofs_iostream {
 	union {
-		int fd;			/* original fd */
+		struct erofs_vfile vf;
 		void *handler;
+#ifdef HAVE_LIBLZMA
+		struct erofs_iostream_liblzma *lzma;
+#endif
 	};
 	u64 sz;
 	char *buffer;
 	unsigned int head, tail, bufsize;
-	int decoder;
+	int decoder, dumpfd;
 	bool feof;
 };
 
 struct erofs_tarfile {
 	struct erofs_pax_header global;
 	struct erofs_iostream ios;
-	char *mapfile;
+	char *mapfile, *dumpfile;
 
+	u32 dev;
 	int fd;
 	u64 offset;
-	bool index_mode, aufs;
+	bool index_mode, headeronly_mode, rvsp_mode, aufs;
+	bool ddtaridx_mode;
 };
 
 void erofs_iostream_close(struct erofs_iostream *ios);

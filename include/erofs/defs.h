@@ -3,7 +3,7 @@
  * Copyright (C) 2018 HUAWEI, Inc.
  *             http://www.huawei.com/
  * Created by Li Guifu <bluce.liguifu@huawei.com>
- * Modified by Gao Xiang <gaoxiang25@huawei.com>
+ * Modified by Gao Xiang <xiang@kernel.org>
  */
 #ifndef __EROFS_DEFS_H
 #define __EROFS_DEFS_H
@@ -204,6 +204,11 @@ static inline void put_unaligned_le32(u32 val, void *p)
 	__put_unaligned_t(__le32, cpu_to_le32(val), p);
 }
 
+static inline u32 get_unaligned_le64(const void *p)
+{
+	return le64_to_cpu(__get_unaligned_t(__le64, p));
+}
+
 /**
  * ilog2 - log of base 2 of 32-bit or a 64-bit unsigned value
  * @n - parameter
@@ -283,7 +288,7 @@ static inline void put_unaligned_le32(u32 val, void *p)
 
 static inline unsigned int fls_long(unsigned long x)
 {
-	return x ? sizeof(x) * 8 - __builtin_clz(x) : 0;
+	return x ? sizeof(x) * 8 - __builtin_clzl(x) : 0;
 }
 
 static inline unsigned long lowbit(unsigned long n)
@@ -327,16 +332,22 @@ unsigned long __roundup_pow_of_two(unsigned long n)
 #define ST_ATIM_NSEC(stbuf) ((stbuf)->st_atim.tv_nsec)
 #define ST_CTIM_NSEC(stbuf) ((stbuf)->st_ctim.tv_nsec)
 #define ST_MTIM_NSEC(stbuf) ((stbuf)->st_mtim.tv_nsec)
+#define ST_MTIM_NSEC_SET(stbuf, val) (stbuf)->st_mtim.tv_nsec = (val)
 #elif defined(HAVE_STRUCT_STAT_ST_ATIMENSEC)
 /* macOS */
 #define ST_ATIM_NSEC(stbuf) ((stbuf)->st_atimensec)
 #define ST_CTIM_NSEC(stbuf) ((stbuf)->st_ctimensec)
 #define ST_MTIM_NSEC(stbuf) ((stbuf)->st_mtimensec)
+#define ST_MTIM_NSEC_SET(stbuf, val) (stbuf)->st_mtimensec = (val)
 #else
 #define ST_ATIM_NSEC(stbuf) 0
 #define ST_CTIM_NSEC(stbuf) 0
 #define ST_MTIM_NSEC(stbuf) 0
+#define ST_MTIM_NSEC_SET(stbuf, val) do { } while (0)
 #endif
+
+#define __erofs_likely(x)      __builtin_expect(!!(x), 1)
+#define __erofs_unlikely(x)    __builtin_expect(!!(x), 0)
 
 #ifdef __cplusplus
 }
