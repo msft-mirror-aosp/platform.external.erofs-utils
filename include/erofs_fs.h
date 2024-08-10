@@ -304,6 +304,7 @@ enum {
 	Z_EROFS_COMPRESSION_LZ4		= 0,
 	Z_EROFS_COMPRESSION_LZMA	= 1,
 	Z_EROFS_COMPRESSION_DEFLATE	= 2,
+	Z_EROFS_COMPRESSION_ZSTD	= 3,
 	Z_EROFS_COMPRESSION_MAX
 };
 #define Z_EROFS_ALL_COMPR_ALGS		((1 << Z_EROFS_COMPRESSION_MAX) - 1)
@@ -329,6 +330,15 @@ struct z_erofs_deflate_cfgs {
 	u8 windowbits;			/* 8..15 for DEFLATE */
 	u8 reserved[5];
 } __packed;
+
+/* 6 bytes (+ length field = 8 bytes) */
+struct z_erofs_zstd_cfgs {
+	u8 format;
+	u8 windowlog;		/* windowLog - ZSTD_WINDOWLOG_ABSOLUTEMIN(10) */
+	u8 reserved[4];
+} __packed;
+
+#define Z_EROFS_ZSTD_MAX_DICT_SIZE	Z_EROFS_PCLUSTER_MAX_SIZE
 
 /*
  * bit 0 : COMPACTED_2B indexes (0 - off; 1 - on)
@@ -440,12 +450,14 @@ struct z_erofs_lcluster_index {
 /* check the EROFS on-disk layout strictly at compile time */
 static inline void erofs_check_ondisk_layout_definitions(void)
 {
+#ifndef __cplusplus
 	const union {
 		struct z_erofs_map_header h;
 		__le64 v;
 	} fmh __maybe_unused = {
 		.h.h_clusterbits = 1 << Z_EROFS_FRAGMENT_INODE_BIT,
 	};
+#endif
 
 	BUILD_BUG_ON(sizeof(struct erofs_super_block) != 128);
 	BUILD_BUG_ON(sizeof(struct erofs_inode_compact) != 32);
@@ -464,9 +476,11 @@ static inline void erofs_check_ondisk_layout_definitions(void)
 
 	BUILD_BUG_ON(BIT(Z_EROFS_LI_LCLUSTER_TYPE_BITS) <
 		     Z_EROFS_LCLUSTER_TYPE_MAX - 1);
+#ifndef __cplusplus
 	/* exclude old compiler versions like gcc 7.5.0 */
 	BUILD_BUG_ON(__builtin_constant_p(fmh.v) ?
 		     fmh.v != cpu_to_le64(1ULL << 63) : 0);
+#endif
 }
 
 #endif

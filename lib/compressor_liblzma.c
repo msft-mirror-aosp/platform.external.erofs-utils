@@ -9,6 +9,7 @@
 #include "erofs/config.h"
 #include "erofs/print.h"
 #include "erofs/internal.h"
+#include "erofs/atomic.h"
 #include "compressor.h"
 
 struct erofs_liblzma_context {
@@ -55,55 +56,72 @@ static int erofs_compressor_liblzma_exit(struct erofs_compress *c)
 static int erofs_compressor_liblzma_setlevel(struct erofs_compress *c,
 					     int compression_level)
 {
-	struct erofs_liblzma_context *ctx = c->private_data;
-	u32 preset;
-
 	if (compression_level < 0)
-		preset = LZMA_PRESET_DEFAULT;
-	else if (compression_level >= 100)
-		preset = (compression_level - 100) | LZMA_PRESET_EXTREME;
-	else
-		preset = compression_level;
+		compression_level = erofs_compressor_lzma.default_level;
 
-	if (lzma_lzma_preset(&ctx->opt, preset))
+	if (compression_level > erofs_compressor_lzma.best_level) {
+		erofs_err("invalid compression level %d", compression_level);
 		return -EINVAL;
-
-	/* XXX: temporary hack */
-	if (cfg.c_dict_size) {
-		if (cfg.c_dict_size > Z_EROFS_LZMA_MAX_DICT_SIZE) {
-			erofs_err("dict size %u is too large", cfg.c_dict_size);
-			return -EINVAL;
-		}
-		ctx->opt.dict_size = cfg.c_dict_size;
-	} else {
-		if (ctx->opt.dict_size > Z_EROFS_LZMA_MAX_DICT_SIZE)
-			ctx->opt.dict_size = Z_EROFS_LZMA_MAX_DICT_SIZE;
-		cfg.c_dict_size = ctx->opt.dict_size;
 	}
 	c->compression_level = compression_level;
+	return 0;
+}
+
+static int erofs_compressor_liblzma_setdictsize(struct erofs_compress *c,
+						u32 dict_size)
+{
+	if (!dict_size) {
+		if (erofs_compressor_lzma.default_dictsize) {
+			dict_size = erofs_compressor_lzma.default_dictsize;
+		} else {
+			dict_size = min_t(u32, Z_EROFS_LZMA_MAX_DICT_SIZE,
+					  cfg.c_mkfs_pclustersize_max << 3);
+			if (dict_size < 32768)
+				dict_size = 32768;
+		}
+	}
+
+	if (dict_size > Z_EROFS_LZMA_MAX_DICT_SIZE || dict_size < 4096) {
+		erofs_err("invalid dictionary size %u", dict_size);
+		return -EINVAL;
+	}
+	c->dict_size = dict_size;
 	return 0;
 }
 
 static int erofs_compressor_liblzma_init(struct erofs_compress *c)
 {
 	struct erofs_liblzma_context *ctx;
+	u32 preset;
 
 	ctx = malloc(sizeof(*ctx));
 	if (!ctx)
 		return -ENOMEM;
 	ctx->strm = (lzma_stream)LZMA_STREAM_INIT;
+
+	if (c->compression_level < 0)
+		preset = LZMA_PRESET_DEFAULT;
+	else if (c->compression_level >= 100)
+		preset = (c->compression_level - 100) | LZMA_PRESET_EXTREME;
+	else
+		preset = c->compression_level;
+
+	if (lzma_lzma_preset(&ctx->opt, preset))
+		return -EINVAL;
+	ctx->opt.dict_size = c->dict_size;
+
 	c->private_data = ctx;
-	erofs_warn("EXPERIMENTAL MicroLZMA feature in use. Use at your own risk!");
-	erofs_warn("Note that it may take more time since the compressor is still single-threaded for now.");
 	return 0;
 }
 
 const struct erofs_compressor erofs_compressor_lzma = {
 	.default_level = LZMA_PRESET_DEFAULT,
 	.best_level = 109,
+	.max_dictsize = Z_EROFS_LZMA_MAX_DICT_SIZE,
 	.init = erofs_compressor_liblzma_init,
 	.exit = erofs_compressor_liblzma_exit,
 	.setlevel = erofs_compressor_liblzma_setlevel,
+	.setdictsize = erofs_compressor_liblzma_setdictsize,
 	.compress_destsize = erofs_liblzma_compress_destsize,
 };
 #endif
