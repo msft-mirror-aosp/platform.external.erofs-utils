@@ -9,7 +9,6 @@
 #include "erofs/blobchunk.h"
 #include "erofs/block_list.h"
 #include "erofs/cache.h"
-#include "erofs/io.h"
 #include "sha256.h"
 #include <unistd.h>
 
@@ -195,7 +194,8 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 					0 : extent_end - extent_start,
 					   first_extent, true);
 
-	return dev_write(inode->sbi, inode->chunkindexes, off, inode->extent_isize);
+	return erofs_dev_write(inode->sbi, inode->chunkindexes, off,
+			       inode->extent_isize);
 }
 
 int erofs_blob_mergechunks(struct erofs_inode *inode, unsigned int chunkbits,
@@ -374,6 +374,47 @@ err:
 	return ret;
 }
 
+int erofs_write_zero_inode(struct erofs_inode *inode)
+{
+	struct erofs_sb_info *sbi = inode->sbi;
+	unsigned int chunkbits = ilog2(inode->i_size - 1) + 1;
+	unsigned int count;
+	erofs_off_t chunksize, len, pos;
+	struct erofs_inode_chunk_index *idx;
+
+	if (chunkbits < sbi->blkszbits)
+		chunkbits = sbi->blkszbits;
+	if (chunkbits - sbi->blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
+		chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + sbi->blkszbits;
+
+	inode->u.chunkformat |= chunkbits - sbi->blkszbits;
+
+	chunksize = 1ULL << chunkbits;
+	count = DIV_ROUND_UP(inode->i_size, chunksize);
+
+	inode->extent_isize = count * EROFS_BLOCK_MAP_ENTRY_SIZE;
+	idx = calloc(count, max(sizeof(*idx), sizeof(void *)));
+	if (!idx)
+		return -ENOMEM;
+	inode->chunkindexes = idx;
+
+	for (pos = 0; pos < inode->i_size; pos += len) {
+		struct erofs_blobchunk *chunk;
+
+		len = min_t(erofs_off_t, inode->i_size - pos, chunksize);
+		chunk = erofs_get_unhashed_chunk(0, EROFS_NULL_ADDR, -1);
+		if (IS_ERR(chunk)) {
+			free(inode->chunkindexes);
+			inode->chunkindexes = NULL;
+			return PTR_ERR(chunk);
+		}
+
+		*(void **)idx++ = chunk;
+	}
+	inode->datalayout = EROFS_INODE_CHUNK_BASED;
+	return 0;
+}
+
 int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
@@ -436,7 +477,7 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 {
 	struct erofs_buffer_head *bh;
 	ssize_t length;
-	erofs_off_t pos_in, pos_out;
+	u64 pos_in, pos_out;
 	ssize_t ret;
 
 	if (blobfile) {
@@ -455,7 +496,7 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 		unsigned int i, ret;
 		erofs_blk_t nblocks;
 
-		nblocks = erofs_mapbh(NULL);
+		nblocks = erofs_mapbh(sbi->bmgr, NULL);
 		pos_out = erofs_btell(bh_devt, false);
 		i = 0;
 		do {
@@ -465,7 +506,7 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 			};
 
 			memcpy(dis.tag, sbi->devs[i].tag, sizeof(dis.tag));
-			ret = dev_write(sbi, &dis, pos_out, sizeof(dis));
+			ret = erofs_dev_write(sbi, &dis, pos_out, sizeof(dis));
 			if (ret)
 				return ret;
 			pos_out += sizeof(dis);
@@ -476,21 +517,22 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 		return 0;
 	}
 
-	bh = erofs_balloc(DATA, blobfile ? datablob_size : 0, 0, 0);
+	bh = erofs_balloc(sbi->bmgr, DATA, datablob_size, 0, 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
-	erofs_mapbh(bh->block);
+	erofs_mapbh(NULL, bh->block);
 
 	pos_out = erofs_btell(bh, false);
 	remapped_base = erofs_blknr(sbi, pos_out);
+	pos_out += sbi->bdev.offset;
 	if (blobfile) {
 		pos_in = 0;
 		ret = erofs_copy_file_range(fileno(blobfile), &pos_in,
-				sbi->devfd, &pos_out, datablob_size);
+				sbi->bdev.fd, &pos_out, datablob_size);
 		ret = ret < datablob_size ? -EIO : 0;
 	} else {
-		ret = 0;
+		ret = erofs_io_ftruncate(&sbi->bdev, pos_out + datablob_size);
 	}
 	bh->op = &erofs_drop_directly_bhops;
 	erofs_bdrop(bh, false);
@@ -506,11 +548,17 @@ void erofs_blob_exit(void)
 	if (blobfile)
 		fclose(blobfile);
 
-	while ((e = hashmap_iter_first(&blob_hashmap, &iter))) {
+	/* Disable hashmap shrink, effectively disabling rehash.
+	 * This way we can iterate over entire hashmap efficiently
+	 * and safely by using hashmap_iter_next() */
+	hashmap_disable_shrink(&blob_hashmap);
+	e = hashmap_iter_first(&blob_hashmap, &iter);
+	while (e) {
 		bc = container_of((struct hashmap_entry *)e,
 				  struct erofs_blobchunk, ent);
 		DBG_BUGON(hashmap_remove(&blob_hashmap, e) != e);
 		free(bc);
+		e = hashmap_iter_next(&iter);
 	}
 	DBG_BUGON(hashmap_free(&blob_hashmap));
 
@@ -578,13 +626,13 @@ int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
 	if (!sbi->devs)
 		return -ENOMEM;
 
-	bh_devt = erofs_balloc(DEVT,
+	bh_devt = erofs_balloc(sbi->bmgr, DEVT,
 		sizeof(struct erofs_deviceslot) * devices, 0, 0);
 	if (IS_ERR(bh_devt)) {
 		free(sbi->devs);
 		return PTR_ERR(bh_devt);
 	}
-	erofs_mapbh(bh_devt->block);
+	erofs_mapbh(NULL, bh_devt->block);
 	bh_devt->op = &erofs_skip_write_bhops;
 	sbi->devt_slotoff = erofs_btell(bh_devt, false) / EROFS_DEVT_SLOT_SIZE;
 	sbi->extra_devices = devices;
