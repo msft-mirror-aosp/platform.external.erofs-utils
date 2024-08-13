@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2019 HUAWEI, Inc.
  *             http://www.huawei.com/
- * Created by Gao Xiang <gaoxiang25@huawei.com>
+ * Created by Gao Xiang <xiang@kernel.org>
  */
 #ifndef __EROFS_INTERNAL_H
 #define __EROFS_INTERNAL_H
@@ -22,6 +22,11 @@ typedef unsigned short umode_t;
 #include <sys/types.h> /* for off_t definition */
 #include <sys/stat.h> /* for S_ISCHR definition */
 #include <stdio.h>
+#ifdef HAVE_PTHREAD_H
+#include <pthread.h>
+#endif
+#include "atomic.h"
+#include "io.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX        4096    /* # chars in a path name including nul */
@@ -43,20 +48,29 @@ typedef u32 erofs_blk_t;
 #define NULL_ADDR_UL	((unsigned long)-1)
 
 /* global sbi */
-extern struct erofs_sb_info sbi;
+extern struct erofs_sb_info g_sbi;
 
 #define erofs_blksiz(sbi)	(1u << (sbi)->blkszbits)
 #define erofs_blknr(sbi, addr)  ((addr) >> (sbi)->blkszbits)
 #define erofs_blkoff(sbi, addr) ((addr) & (erofs_blksiz(sbi) - 1))
 #define erofs_pos(sbi, nr)      ((erofs_off_t)(nr) << (sbi)->blkszbits)
-#define BLK_ROUND_UP(sbi, addr)	DIV_ROUND_UP(addr, erofs_blksiz(sbi))
+#define BLK_ROUND_UP(sbi, addr)	\
+	(roundup(addr, erofs_blksiz(sbi)) >> (sbi)->blkszbits)
 
 struct erofs_buffer_head;
+struct erofs_bufmgr;
 
 struct erofs_device_info {
 	u8 tag[64];
 	u32 blocks;
 	u32 mapped_blkaddr;
+};
+
+/* all filesystem-wide lz4 configurations */
+struct erofs_sb_lz4_info {
+	u16 max_distance;
+	/* maximum possible blocks for pclusters in the filesystem */
+	u16 max_pclusterblks;
 };
 
 struct erofs_xattr_prefix_item {
@@ -66,7 +80,9 @@ struct erofs_xattr_prefix_item {
 
 #define EROFS_PACKED_NID_UNALLOCATED	-1
 
+struct erofs_mkfs_dfops;
 struct erofs_sb_info {
+	struct erofs_sb_lz4_info lz4;
 	struct erofs_device_info *devs;
 	char *devname;
 
@@ -78,12 +94,13 @@ struct erofs_sb_info {
 
 	u32 feature_compat;
 	u32 feature_incompat;
-	u64 build_time;
-	u32 build_time_nsec;
 
-	u8  extslots;
 	unsigned char islotbits;
 	unsigned char blkszbits;
+
+	u32 sb_size;			/* total superblock size */
+	u32 build_time_nsec;
+	u64 build_time;
 
 	/* what we really care is nid, rather than ino.. */
 	erofs_nid_t root_nid;
@@ -93,10 +110,8 @@ struct erofs_sb_info {
 	u8 uuid[16];
 	char volume_name[16];
 
-	u16 available_compr_algs;
-	u16 lz4_max_distance;
-
 	u32 checksum;
+	u16 available_compr_algs;
 	u16 extra_devices;
 	union {
 		u16 devt_slotoff;		/* used for mkfs */
@@ -108,7 +123,8 @@ struct erofs_sb_info {
 	u8 xattr_prefix_count;
 	struct erofs_xattr_prefix_item *xattr_prefixes;
 
-	int devfd, devblksz;
+	struct erofs_vfile bdev;
+	int devblksz;
 	u64 devsz;
 	dev_t dev;
 	unsigned int nblobs;
@@ -117,7 +133,16 @@ struct erofs_sb_info {
 	struct list_head list;
 
 	u64 saved_by_deduplication;
+
+#ifdef EROFS_MT_ENABLED
+	pthread_t dfops_worker;
+	struct erofs_mkfs_dfops *mkfs_dfops;
+#endif
+	struct erofs_bufmgr *bmgr;
+	bool useqpl;
 };
+
+#define EROFS_SUPER_END (EROFS_SUPER_OFFSET + sizeof(struct erofs_super_block))
 
 /* make sure that any user of the erofs headers has atleast 64bit off_t type */
 extern int erofs_assert_largefile[sizeof(off_t)-8];
@@ -153,6 +178,11 @@ EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
 
 struct erofs_diskbuf;
 
+#define EROFS_INODE_DATA_SOURCE_NONE		0
+#define EROFS_INODE_DATA_SOURCE_LOCALPATH	1
+#define EROFS_INODE_DATA_SOURCE_DISKBUF		2
+#define EROFS_INODE_DATA_SOURCE_RESVSP		3
+
 struct erofs_inode {
 	struct list_head i_hash, i_subdirs, i_xattrs;
 
@@ -163,7 +193,7 @@ struct erofs_inode {
 		/* (mkfs.erofs) next pointer for directory dumping */
 		struct erofs_inode *next_dirwrite;
 	};
-	unsigned int i_count;
+	erofs_atomic_t i_count;
 	struct erofs_sb_info *sbi;
 	struct erofs_inode *i_parent;
 
@@ -199,9 +229,9 @@ struct erofs_inode {
 	unsigned char inode_isize;
 	/* inline tail-end packing size */
 	unsigned short idata_size;
+	char datasource;
 	bool compressed_idata;
 	bool lazy_tailblock;
-	bool with_diskbuf;
 	bool opaque;
 	/* OVL: non-merge dir that may contain whiteout entries */
 	bool whiteouts;
@@ -230,16 +260,20 @@ struct erofs_inode {
 			uint8_t  z_algorithmtype[2];
 			uint8_t  z_logical_clusterbits;
 			uint8_t  z_physical_clusterblks;
-			uint64_t z_tailextent_headlcn;
-			unsigned int    z_idataoff;
+			union {
+				uint64_t z_tailextent_headlcn;
+				erofs_off_t fragment_size;
+			};
+			union {
+				unsigned int z_idataoff;
+				erofs_off_t fragmentoff;
+			};
 #define z_idata_size	idata_size
 		};
 	};
 #ifdef WITH_ANDROID
 	uint64_t capabilities;
 #endif
-	erofs_off_t fragmentoff;
-	unsigned int fragment_size;
 };
 
 static inline erofs_off_t erofs_iloc(struct erofs_inode *inode)
@@ -273,17 +307,22 @@ static inline unsigned int erofs_inode_datalayout(unsigned int value)
 			      EROFS_I_DATALAYOUT_BITS);
 }
 
-#define IS_ROOT(x)	((x) == (x)->i_parent)
+static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
+{
+	return (struct erofs_inode *)((unsigned long)inode->i_parent & ~1UL);
+}
+
+#define IS_ROOT(x)	((x) == erofs_parent_inode(x))
 
 struct erofs_dentry {
 	struct list_head d_child;	/* child of parent list */
-
-	unsigned int type;
-	char name[EROFS_NAME_LEN];
 	union {
 		struct erofs_inode *inode;
 		erofs_nid_t nid;
 	};
+	char name[EROFS_NAME_LEN];
+	u8 type;
+	bool validnid;
 };
 
 static inline bool is_dot_dotdot_len(const char *name, unsigned int len)
@@ -369,6 +408,10 @@ struct erofs_map_dev {
 /* super.c */
 int erofs_read_superblock(struct erofs_sb_info *sbi);
 void erofs_put_super(struct erofs_sb_info *sbi);
+int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh,
+		  erofs_blk_t *blocks);
+struct erofs_buffer_head *erofs_reserve_sb(struct erofs_bufmgr *bmgr);
+int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc);
 
 /* namei.c */
 int erofs_read_inode_from_disk(struct erofs_inode *vi);
@@ -387,6 +430,7 @@ int z_erofs_read_one_data(struct erofs_inode *inode,
 			erofs_off_t skip, erofs_off_t length, bool trimmed);
 void *erofs_read_metadata(struct erofs_sb_info *sbi, erofs_nid_t nid,
 			  erofs_off_t *offset, int *lengthp);
+int z_erofs_parse_cfgs(struct erofs_sb_info *sbi, struct erofs_super_block *dsb);
 
 static inline int erofs_get_occupied_size(const struct erofs_inode *inode,
 					  erofs_off_t *size)
@@ -417,6 +461,49 @@ int erofs_listxattr(struct erofs_inode *vi, char *buffer, size_t buffer_size);
 int z_erofs_fill_inode(struct erofs_inode *vi);
 int z_erofs_map_blocks_iter(struct erofs_inode *vi,
 			    struct erofs_map_blocks *map, int flags);
+
+/* io.c */
+int erofs_dev_open(struct erofs_sb_info *sbi, const char *dev, int flags);
+void erofs_dev_close(struct erofs_sb_info *sbi);
+void erofs_blob_closeall(struct erofs_sb_info *sbi);
+int erofs_blob_open_ro(struct erofs_sb_info *sbi, const char *dev);
+
+ssize_t erofs_dev_read(struct erofs_sb_info *sbi, int device_id,
+		       void *buf, u64 offset, size_t len);
+
+static inline int erofs_dev_write(struct erofs_sb_info *sbi, const void *buf,
+				  u64 offset, size_t len)
+{
+	if (erofs_io_pwrite(&sbi->bdev, buf, offset, len) != (ssize_t)len)
+		return -EIO;
+	return 0;
+}
+
+static inline int erofs_dev_fillzero(struct erofs_sb_info *sbi, u64 offset,
+				     size_t len, bool pad)
+{
+	return erofs_io_fallocate(&sbi->bdev, offset, len, pad);
+}
+
+static inline int erofs_dev_resize(struct erofs_sb_info *sbi,
+				   erofs_blk_t blocks)
+{
+	return erofs_io_ftruncate(&sbi->bdev, (u64)blocks * erofs_blksiz(sbi));
+}
+
+static inline int erofs_blk_write(struct erofs_sb_info *sbi, const void *buf,
+				  erofs_blk_t blkaddr, u32 nblocks)
+{
+	return erofs_dev_write(sbi, buf, erofs_pos(sbi, blkaddr),
+			       erofs_pos(sbi, nblocks));
+}
+
+static inline int erofs_blk_read(struct erofs_sb_info *sbi, int device_id,
+				 void *buf, erofs_blk_t start, u32 nblocks)
+{
+	return erofs_dev_read(sbi, device_id, buf, erofs_pos(sbi, start),
+			      erofs_pos(sbi, nblocks));
+}
 
 #ifdef EUCLEAN
 #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
