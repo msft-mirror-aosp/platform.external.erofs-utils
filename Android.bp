@@ -92,14 +92,28 @@ cc_defaults {
         "external/e2fsprogs/lib/",
     ],
     generated_headers: ["erofs-utils-version.h"],
-    static_libs: [
-        "libbase",
-        "libcutils",
-        "libext2_uuid",
-        "liblog",
-        "liblz4",
-        "libselinux",
-    ],
+    target: {
+        android: {
+            shared_libs: [
+                "libbase",
+                "libcutils",
+                "libext2_uuid",
+                "liblog",
+                "liblz4",
+                "libselinux",
+            ],
+        },
+        host: {
+            static_libs: [
+                "libbase",
+                "libcutils",
+                "libext2_uuid",
+                "liblog",
+                "liblz4",
+                "libselinux",
+            ],
+        },
+    },
 }
 
 cc_library {
@@ -112,6 +126,8 @@ cc_library {
     ],
     exclude_srcs: [
         "lib/compressor_libdeflate.c",
+        "lib/compressor_libzstd.c",
+        "lib/workqueue.c",
     ],
     export_include_dirs: ["include"],
 
