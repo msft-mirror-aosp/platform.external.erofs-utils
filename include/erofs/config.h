@@ -27,12 +27,19 @@ enum {
 };
 
 enum {
+	TIMESTAMP_UNSPECIFIED,
 	TIMESTAMP_NONE,
 	TIMESTAMP_FIXED,
 	TIMESTAMP_CLAMPING,
 };
 
 #define EROFS_MAX_COMPR_CFGS		64
+
+struct erofs_compr_opts {
+	char *alg;
+	int level;
+	u32 dict_size;
+};
 
 struct erofs_configure {
 	const char *c_version;
@@ -64,28 +71,29 @@ struct erofs_configure {
 	char *c_src_path;
 	char *c_blobdev_path;
 	char *c_compress_hints_file;
-	char *c_compr_alg[EROFS_MAX_COMPR_CFGS];
-	int c_compr_level[EROFS_MAX_COMPR_CFGS];
+	struct erofs_compr_opts c_compr_opts[EROFS_MAX_COMPR_CFGS];
 	char c_force_inodeversion;
 	char c_force_chunkformat;
 	/* < 0, xattr disabled and INT_MAX, always use inline xattrs */
 	int c_inline_xattr_tolerance;
-
-	u32 c_pclusterblks_max, c_pclusterblks_def, c_pclusterblks_packed;
+#ifdef EROFS_MT_ENABLED
+	u64 c_mkfs_segment_size;
+	u32 c_mt_workers;
+#endif
+	u32 c_mkfs_pclustersize_max;
+	u32 c_mkfs_pclustersize_def;
+	u32 c_mkfs_pclustersize_packed;
 	u32 c_max_decompressed_extent_bytes;
-	u32 c_dict_size;
 	u64 c_unix_timestamp;
 	u32 c_uid, c_gid;
 	const char *mount_point;
 	long long c_uid_offset, c_gid_offset;
+	u32 c_root_xattr_isize;
 #ifdef WITH_ANDROID
 	char *target_out_path;
 	char *fs_config_file;
 	char *block_list_file;
 #endif
-
-	/* offset when reading multi partition images */
-	u64 c_offset;
 };
 
 extern struct erofs_configure cfg;
@@ -93,6 +101,9 @@ extern struct erofs_configure cfg;
 void erofs_init_configure(void);
 void erofs_show_config(void);
 void erofs_exit_configure(void);
+
+/* (will be deprecated) temporary helper for updating global the cfg */
+struct erofs_configure *erofs_get_configure();
 
 void erofs_set_fs_root(const char *rootdir);
 const char *erofs_fspath(const char *fullpath);
@@ -108,6 +119,7 @@ static inline int erofs_selabel_open(const char *file_contexts)
 
 void erofs_update_progressinfo(const char *fmt, ...);
 char *erofs_trim_for_progressinfo(const char *str, int placeholder);
+unsigned int erofs_get_available_processors(void);
 
 #ifdef __cplusplus
 }

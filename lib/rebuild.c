@@ -11,11 +11,11 @@
 #include "erofs/print.h"
 #include "erofs/inode.h"
 #include "erofs/rebuild.h"
-#include "erofs/io.h"
 #include "erofs/dir.h"
 #include "erofs/xattr.h"
 #include "erofs/blobchunk.h"
 #include "erofs/internal.h"
+#include "liberofs_uuid.h"
 
 #ifdef HAVE_LINUX_AUFS_TYPE_H
 #include <linux/aufs_type.h>
@@ -31,10 +31,15 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	struct erofs_inode *inode;
 	struct erofs_dentry *d;
 
-	inode = erofs_new_inode();
+	inode = erofs_new_inode(dir->sbi);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
 
+	if (asprintf(&inode->i_srcpath, "%s/%s",
+		     dir->i_srcpath ? : "", s) < 0) {
+		erofs_iput(inode);
+		return ERR_PTR(-ENOMEM);
+	}
 	inode->i_mode = S_IFDIR | 0755;
 	inode->i_parent = dir;
 	inode->i_uid = getuid();
@@ -44,7 +49,9 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	erofs_init_empty_dir(inode);
 
 	d = erofs_d_alloc(dir, s);
-	if (!IS_ERR(d)) {
+	if (IS_ERR(d)) {
+		erofs_iput(inode);
+	} else {
 		d->type = EROFS_FT_DIR;
 		d->inode = inode;
 	}
@@ -128,7 +135,8 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 	return d;
 }
 
-static int erofs_rebuild_fixup_inode_index(struct erofs_inode *inode)
+static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
+					  struct erofs_inode *inode)
 {
 	int ret;
 	unsigned int count, unit, chunkbits, i;
@@ -137,26 +145,26 @@ static int erofs_rebuild_fixup_inode_index(struct erofs_inode *inode)
 	erofs_blk_t blkaddr;
 
 	/* TODO: fill data map in other layouts */
-	if (inode->datalayout != EROFS_INODE_CHUNK_BASED &&
-	    inode->datalayout != EROFS_INODE_FLAT_PLAIN) {
-		erofs_err("%s: unsupported datalayout %d", inode->i_srcpath, inode->datalayout);
+	if (inode->datalayout == EROFS_INODE_CHUNK_BASED) {
+		chunkbits = inode->u.chunkbits;
+		if (chunkbits < dst_sb->blkszbits) {
+			erofs_err("%s: chunk size %u is smaller than the target block size %u",
+				  inode->i_srcpath, 1U << chunkbits,
+				  1U << dst_sb->blkszbits);
+			return -EINVAL;
+		}
+	} else if (inode->datalayout == EROFS_INODE_FLAT_PLAIN) {
+		chunkbits = ilog2(inode->i_size - 1) + 1;
+		if (chunkbits < dst_sb->blkszbits)
+			chunkbits = dst_sb->blkszbits;
+		if (chunkbits - dst_sb->blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
+			chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + dst_sb->blkszbits;
+	} else {
+		erofs_err("%s: unsupported datalayout %d ", inode->i_srcpath,
+			  inode->datalayout);
 		return -EOPNOTSUPP;
 	}
 
-	if (inode->sbi->extra_devices) {
-		chunkbits = inode->u.chunkbits;
-		if (chunkbits < sbi.blkszbits) {
-			erofs_err("%s: chunk size %u is too small to fit the target block size %u",
-				  inode->i_srcpath, 1U << chunkbits, 1U << sbi.blkszbits);
-			return -EINVAL;
-		}
-	} else {
-		chunkbits = ilog2(inode->i_size - 1) + 1;
-		if (chunkbits < sbi.blkszbits)
-			chunkbits = sbi.blkszbits;
-		if (chunkbits - sbi.blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
-			chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + sbi.blkszbits;
-	}
 	chunksize = 1ULL << chunkbits;
 	count = DIV_ROUND_UP(inode->i_size, chunksize);
 
@@ -178,7 +186,7 @@ static int erofs_rebuild_fixup_inode_index(struct erofs_inode *inode)
 		if (ret)
 			goto err;
 
-		blkaddr = erofs_blknr(&sbi, map.m_pa);
+		blkaddr = erofs_blknr(dst_sb, map.m_pa);
 		chunk = erofs_get_unhashed_chunk(inode->dev, blkaddr, 0);
 		if (IS_ERR(chunk)) {
 			ret = PTR_ERR(chunk);
@@ -189,7 +197,7 @@ static int erofs_rebuild_fixup_inode_index(struct erofs_inode *inode)
 	}
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	inode->u.chunkformat = EROFS_CHUNK_FORMAT_INDEXES;
-	inode->u.chunkformat |= chunkbits - sbi.blkszbits;
+	inode->u.chunkformat |= chunkbits - dst_sb->blkszbits;
 	return 0;
 err:
 	free(inode->chunkindexes);
@@ -197,8 +205,12 @@ err:
 	return ret;
 }
 
-static int erofs_rebuild_fill_inode(struct erofs_inode *inode)
+static int erofs_rebuild_update_inode(struct erofs_sb_info *dst_sb,
+				      struct erofs_inode *inode,
+				      enum erofs_rebuild_datamode datamode)
 {
+	int err = 0;
+
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFCHR:
 		if (erofs_inode_is_whiteout(inode))
@@ -211,42 +223,50 @@ static int erofs_rebuild_fill_inode(struct erofs_inode *inode)
 		erofs_dbg("\tdev: %d %d", major(inode->u.i_rdev),
 			  minor(inode->u.i_rdev));
 		inode->u.i_rdev = erofs_new_encode_dev(inode->u.i_rdev);
-		return 0;
+		break;
 	case S_IFDIR:
-		return erofs_init_empty_dir(inode);
-	case S_IFLNK: {
-		int ret;
-
+		err = erofs_init_empty_dir(inode);
+		break;
+	case S_IFLNK:
 		inode->i_link = malloc(inode->i_size + 1);
 		if (!inode->i_link)
 			return -ENOMEM;
-		ret = erofs_pread(inode, inode->i_link, inode->i_size, 0);
+		err = erofs_pread(inode, inode->i_link, inode->i_size, 0);
 		erofs_dbg("\tsymlink: %s -> %s", inode->i_srcpath, inode->i_link);
-		return ret;
-	}
-	case S_IFREG:
-		if (inode->i_size)
-			return erofs_rebuild_fixup_inode_index(inode);
-		return 0;
-	default:
 		break;
+	case S_IFREG:
+		if (!inode->i_size) {
+			inode->u.i_blkaddr = NULL_ADDR;
+			break;
+		}
+		if (datamode == EROFS_REBUILD_DATA_BLOB_INDEX)
+			err = erofs_rebuild_write_blob_index(dst_sb, inode);
+		else if (datamode == EROFS_REBUILD_DATA_RESVSP)
+			inode->datasource = EROFS_INODE_DATA_SOURCE_RESVSP;
+		else
+			err = -EOPNOTSUPP;
+		break;
+	default:
+		return -EINVAL;
 	}
-	return -EINVAL;
+	return err;
 }
 
 /*
- * @parent:  parent directory in inode tree
- * @ctx.dir: parent directory when itering erofs_iterate_dir()
+ * @mergedir: parent directory in the merged tree
+ * @ctx.dir:  parent directory when itering erofs_iterate_dir()
+ * @datamode: indicate how to import inode data
  */
 struct erofs_rebuild_dir_context {
 	struct erofs_dir_context ctx;
-	struct erofs_inode *parent;
+	struct erofs_inode *mergedir;
+	enum erofs_rebuild_datamode datamode;
 };
 
 static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 {
 	struct erofs_rebuild_dir_context *rctx = (void *)ctx;
-	struct erofs_inode *parent = rctx->parent;
+	struct erofs_inode *mergedir = rctx->mergedir;
 	struct erofs_inode *dir = ctx->dir;
 	struct erofs_inode *inode, *candidate;
 	struct erofs_inode src;
@@ -258,15 +278,15 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 	if (ctx->dot_dotdot)
 		return 0;
 
-	ret = asprintf(&path, "%s/%.*s", rctx->parent->i_srcpath,
+	ret = asprintf(&path, "%s/%.*s", rctx->mergedir->i_srcpath,
 		       ctx->de_namelen, ctx->dname);
 	if (ret < 0)
 		return ret;
 
 	erofs_dbg("parsing %s", path);
-	dname = path + strlen(parent->i_srcpath) + 1;
+	dname = path + strlen(mergedir->i_srcpath) + 1;
 
-	d = erofs_rebuild_get_dentry(parent, dname, false,
+	d = erofs_rebuild_get_dentry(mergedir, dname, false,
 				     &dumb, &dumb, false);
 	if (IS_ERR(d)) {
 		ret = PTR_ERR(d);
@@ -290,13 +310,13 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 		ret = erofs_read_inode_from_disk(&src);
 		if (ret || !S_ISDIR(src.i_mode))
 			goto out;
-		parent = d->inode;
+		mergedir = d->inode;
 		inode = dir = &src;
 	} else {
 		u64 nid;
 
-		DBG_BUGON(parent != d->inode);
-		inode = erofs_new_inode();
+		DBG_BUGON(mergedir != d->inode);
+		inode = erofs_new_inode(dir->sbi);
 		if (IS_ERR(inode)) {
 			ret = PTR_ERR(inode);
 			goto out;
@@ -340,14 +360,15 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 			inode->i_ino[1] = inode->nid;
 			inode->i_nlink = 1;
 
-			ret = erofs_rebuild_fill_inode(inode);
+			ret = erofs_rebuild_update_inode(&g_sbi, inode,
+							 rctx->datamode);
 			if (ret) {
 				erofs_iput(inode);
 				goto out;
 			}
 
-			erofs_insert_ihash(inode, inode->dev, inode->i_ino[1]);
-			parent = dir = inode;
+			erofs_insert_ihash(inode);
+			mergedir = dir = inode;
 		}
 
 		d->inode = inode;
@@ -357,7 +378,7 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 	if (S_ISDIR(inode->i_mode)) {
 		struct erofs_rebuild_dir_context nctx = *rctx;
 
-		nctx.parent = parent;
+		nctx.mergedir = mergedir;
 		nctx.ctx.dir = dir;
 		ret = erofs_iterate_dir(&nctx.ctx, false);
 		if (ret)
@@ -365,27 +386,29 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 	}
 
 	/* reset sbi, nid after subdirs are all loaded for the final dump */
-	inode->sbi = &sbi;
+	inode->sbi = &g_sbi;
 	inode->nid = 0;
 out:
 	free(path);
 	return ret;
 }
 
-int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi)
+int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
+			    enum erofs_rebuild_datamode mode)
 {
 	struct erofs_inode inode = {};
 	struct erofs_rebuild_dir_context ctx;
+	char uuid_str[37];
+	char *fsid = sbi->devname;
 	int ret;
 
-	if (!sbi->devname) {
-		erofs_err("failed to find a device for rebuilding");
-		return -EINVAL;
+	if (!fsid) {
+		erofs_uuid_unparse_lower(sbi->uuid, uuid_str);
+		fsid = uuid_str;
 	}
-
 	ret = erofs_read_superblock(sbi);
 	if (ret) {
-		erofs_err("failed to read superblock of %s", sbi->devname);
+		erofs_err("failed to read superblock of %s", fsid);
 		return ret;
 	}
 
@@ -393,7 +416,7 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi)
 	inode.sbi = sbi;
 	ret = erofs_read_inode_from_disk(&inode);
 	if (ret) {
-		erofs_err("failed to read root inode of %s", sbi->devname);
+		erofs_err("failed to read root inode of %s", fsid);
 		return ret;
 	}
 	inode.i_srcpath = strdup("/");
@@ -401,9 +424,83 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi)
 	ctx = (struct erofs_rebuild_dir_context) {
 		.ctx.dir = &inode,
 		.ctx.cb = erofs_rebuild_dirent_iter,
-		.parent = root,
+		.mergedir = root,
+		.datamode = mode,
 	};
 	ret = erofs_iterate_dir(&ctx.ctx, false);
 	free(inode.i_srcpath);
 	return ret;
+}
+
+static int erofs_rebuild_basedir_dirent_iter(struct erofs_dir_context *ctx)
+{
+	struct erofs_rebuild_dir_context *rctx = (void *)ctx;
+	struct erofs_inode *dir = ctx->dir;
+	struct erofs_inode *mergedir = rctx->mergedir;
+	struct erofs_dentry *d;
+	char *dname;
+	bool dumb;
+	int ret;
+
+	if (ctx->dot_dotdot)
+		return 0;
+
+	dname = strndup(ctx->dname, ctx->de_namelen);
+	if (!dname)
+		return -ENOMEM;
+	d = erofs_rebuild_get_dentry(mergedir, dname, false,
+				     &dumb, &dumb, false);
+	if (IS_ERR(d)) {
+		ret = PTR_ERR(d);
+		goto out;
+	}
+
+	if (d->type == EROFS_FT_UNKNOWN) {
+		d->nid = ctx->de_nid;
+		d->type = ctx->de_ftype;
+		d->validnid = true;
+		if (!mergedir->whiteouts && erofs_dentry_is_wht(dir->sbi, d))
+			mergedir->whiteouts = true;
+	} else {
+		struct erofs_inode *inode = d->inode;
+
+		/* update sub-directories only for recursively loading */
+		if (S_ISDIR(inode->i_mode)) {
+			list_del(&inode->i_hash);
+			inode->dev = dir->sbi->dev;
+			inode->i_ino[1] = ctx->de_nid;
+			erofs_insert_ihash(inode);
+		}
+	}
+	ret = 0;
+out:
+	free(dname);
+	return ret;
+}
+
+int erofs_rebuild_load_basedir(struct erofs_inode *dir)
+{
+	struct erofs_inode fakeinode = {
+		.sbi = dir->sbi,
+		.nid = dir->i_ino[1],
+	};
+	struct erofs_rebuild_dir_context ctx;
+	int ret;
+
+	ret = erofs_read_inode_from_disk(&fakeinode);
+	if (ret) {
+		erofs_err("failed to read inode @ %llu", fakeinode.nid);
+		return ret;
+	}
+
+	/* Inherit the maximum xattr size for the root directory */
+	if (__erofs_unlikely(IS_ROOT(dir)))
+		dir->xattr_isize = fakeinode.xattr_isize;
+
+	ctx = (struct erofs_rebuild_dir_context) {
+		.ctx.dir = &fakeinode,
+		.ctx.cb = erofs_rebuild_basedir_dirent_iter,
+		.mergedir = dir,
+	};
+	return erofs_iterate_dir(&ctx.ctx, false);
 }
