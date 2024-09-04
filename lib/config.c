@@ -7,15 +7,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include "erofs/print.h"
 #include "erofs/internal.h"
 #include "liberofs_private.h"
 #ifdef HAVE_SYS_IOCTL_H
 #include <sys/ioctl.h>
 #endif
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
 
 struct erofs_configure cfg;
-struct erofs_sb_info sbi;
+struct erofs_sb_info g_sbi;
+bool erofs_stdout_tty;
 
 void erofs_init_configure(void)
 {
@@ -30,9 +35,8 @@ void erofs_init_configure(void)
 	cfg.c_unix_timestamp = -1;
 	cfg.c_uid = -1;
 	cfg.c_gid = -1;
-	cfg.c_pclusterblks_max = 1;
-	cfg.c_pclusterblks_def = 1;
 	cfg.c_max_decompressed_extent_bytes = -1;
+	erofs_stdout_tty = isatty(STDOUT_FILENO);
 }
 
 void erofs_show_config(void)
@@ -48,12 +52,23 @@ void erofs_show_config(void)
 
 void erofs_exit_configure(void)
 {
+	int i;
+
 #ifdef HAVE_LIBSELINUX
 	if (cfg.sehnd)
 		selabel_close(cfg.sehnd);
 #endif
 	if (cfg.c_img_path)
 		free(cfg.c_img_path);
+	if (cfg.c_src_path)
+		free(cfg.c_src_path);
+	for (i = 0; i < EROFS_MAX_COMPR_CFGS && cfg.c_compr_opts[i].alg; i++)
+		free(cfg.c_compr_opts[i].alg);
+}
+
+struct erofs_configure *erofs_get_configure()
+{
+	return &cfg;
 }
 
 static unsigned int fullpath_prefix;	/* root directory prefix length */
@@ -101,6 +116,9 @@ char *erofs_trim_for_progressinfo(const char *str, int placeholder)
 {
 	int col, len;
 
+	if (!erofs_stdout_tty) {
+		return strdup(str);
+	} else {
 #ifdef GWINSZ_IN_SYS_IOCTL
 	struct winsize winsize;
 	if(ioctl(1, TIOCGWINSZ, &winsize) >= 0 &&
@@ -108,7 +126,8 @@ char *erofs_trim_for_progressinfo(const char *str, int placeholder)
 		col = winsize.ws_col;
 	else
 #endif
-		col = 80;
+			col = 80;
+	}
 
 	if (col <= placeholder)
 		return strdup("");
@@ -133,7 +152,7 @@ void erofs_msg(int dbglv, const char *fmt, ...)
 	FILE *f = dbglv >= EROFS_ERR ? stderr : stdout;
 
 	if (__erofs_is_progressmsg) {
-		fputc('\n', f);
+		fputc('\n', stdout);
 		__erofs_is_progressmsg = false;
 	}
 	va_start(ap, fmt);
@@ -153,7 +172,21 @@ void erofs_update_progressinfo(const char *fmt, ...)
 	vsprintf(msg, fmt, ap);
 	va_end(ap);
 
-	printf("\r\033[K%s", msg);
-	__erofs_is_progressmsg = true;
-	fflush(stdout);
+	if (erofs_stdout_tty) {
+		printf("\r\033[K%s", msg);
+		__erofs_is_progressmsg = true;
+		fflush(stdout);
+		return;
+	}
+	fputs(msg, stdout);
+	fputc('\n', stdout);
+}
+
+unsigned int erofs_get_available_processors(void)
+{
+#if defined(HAVE_UNISTD_H) && defined(HAVE_SYSCONF)
+	return sysconf(_SC_NPROCESSORS_ONLN);
+#else
+	return 0;
+#endif
 }
