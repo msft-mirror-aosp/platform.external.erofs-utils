@@ -126,6 +126,8 @@ cc_library {
     ],
     exclude_srcs: [
         "lib/compressor_libdeflate.c",
+        "lib/compressor_libzstd.c",
+        "lib/workqueue.c",
     ],
     export_include_dirs: ["include"],
 
