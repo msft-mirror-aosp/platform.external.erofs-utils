@@ -2,11 +2,12 @@
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
- * Created by Gao Xiang <gaoxiang25@huawei.com>
+ * Created by Gao Xiang <xiang@kernel.org>
  */
 #define LZ4_HC_STATIC_LINKING_ONLY (1)
 #include <lz4hc.h>
 #include "erofs/internal.h"
+#include "erofs/print.h"
 #include "compressor.h"
 
 #ifndef LZ4_DISTANCE_MAX	/* history window size */
@@ -42,15 +43,18 @@ static int compressor_lz4hc_init(struct erofs_compress *c)
 	if (!c->private_data)
 		return -ENOMEM;
 
-	c->sbi->lz4_max_distance = LZ4_DISTANCE_MAX;
+	c->sbi->lz4.max_distance = max_t(u16, c->sbi->lz4.max_distance,
+					 LZ4_DISTANCE_MAX);
 	return 0;
 }
 
 static int compressor_lz4hc_setlevel(struct erofs_compress *c,
 				     int compression_level)
 {
-	if (compression_level > LZ4HC_CLEVEL_MAX)
+	if (compression_level > erofs_compressor_lz4hc.best_level) {
+		erofs_err("invalid compression level %d", compression_level);
 		return -EINVAL;
+	}
 
 	c->compression_level = compression_level < 0 ?
 		LZ4HC_CLEVEL_DEFAULT : compression_level;
