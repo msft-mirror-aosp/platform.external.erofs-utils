@@ -75,6 +75,7 @@ cc_defaults {
         "-DHAVE_LGETXATTR",
         "-D_FILE_OFFSET_BITS=64",
         "-DEROFS_MAX_BLOCK_SIZE=16384",
+        "-DHAVE_UTIMENSAT",
     ],
 }
 
