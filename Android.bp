@@ -163,7 +163,13 @@ cc_binary {
 
     defaults: ["mkfs-erofs_defaults"],
     host_supported: true,
-    recovery_available: true,
+}
+
+cc_binary {
+    name: "mkfs.erofs.recovery",
+    defaults: ["mkfs-erofs_defaults"],
+    recovery: true,
+    stem: "mkfs.erofs",
 }
 
 cc_binary_host {
@@ -173,17 +179,21 @@ cc_binary_host {
     stl: "libc++_static"
 }
 
-cc_binary {
-    name: "dump.erofs",
+cc_defaults {
+    name: "dump.erofs_defaults",
     defaults: ["erofs-utils_defaults"],
-    host_supported: true,
-    recovery_available: true,
     srcs: [
         "dump/*.c",
     ],
     static_libs: [
         "liberofs",
     ],
+}
+
+cc_binary {
+    name: "dump.erofs",
+    defaults: ["dump.erofs_defaults"],
+    host_supported: true,
     target: {
         darwin: {
             enabled: false,
@@ -192,19 +202,37 @@ cc_binary {
 }
 
 cc_binary {
-    name: "fsck.erofs",
+    name: "dump.erofs.recovery",
+    defaults: ["dump.erofs_defaults"],
+    recovery: true,
+    stem: "dump.erofs",
+}
+
+cc_defaults {
+    name: "fsck.erofs_defaults",
     defaults: ["erofs-utils_defaults"],
-    host_supported: true,
-    recovery_available: true,
     srcs: [
         "fsck/*.c",
     ],
     static_libs: [
         "liberofs",
     ],
+}
+
+cc_binary {
+    name: "fsck.erofs",
+    defaults: ["fsck.erofs_defaults"],
+    host_supported: true,
     target: {
         darwin: {
             enabled: false,
         },
     },
+}
+
+cc_binary {
+    name: "fsck.erofs.recovery",
+    defaults: ["fsck.erofs_defaults"],
+    recovery: true,
+    stem: "fsck.erofs",
 }
