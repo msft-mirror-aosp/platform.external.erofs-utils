@@ -515,7 +515,8 @@ static bool erofs_file_is_compressible(struct erofs_inode *inode)
 static int write_uncompressed_file_from_fd(struct erofs_inode *inode, int fd)
 {
 	int ret;
-	unsigned int nblocks;
+	erofs_blk_t nblocks, i;
+	unsigned int len;
 	struct erofs_sb_info *sbi = inode->sbi;
 
 	inode->datalayout = EROFS_INODE_FLAT_INLINE;
@@ -525,12 +526,16 @@ static int write_uncompressed_file_from_fd(struct erofs_inode *inode, int fd)
 	if (ret)
 		return ret;
 
-	ret = erofs_io_xcopy(&sbi->bdev, erofs_pos(sbi, inode->u.i_blkaddr),
-			     &((struct erofs_vfile){ .fd = fd }),
-			     erofs_pos(sbi, nblocks),
+	for (i = 0; i < nblocks; i += (len >> sbi->blkszbits)) {
+		len = min_t(u64, round_down(UINT_MAX, 1U << sbi->blkszbits),
+			    erofs_pos(sbi, nblocks - i));
+		ret = erofs_io_xcopy(&sbi->bdev,
+				     erofs_pos(sbi, inode->u.i_blkaddr + i),
+				     &((struct erofs_vfile){ .fd = fd }), len,
 			inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF);
-	if (ret)
-		return ret;
+		if (ret)
+			return ret;
+	}
 
 	/* read the tail-end data */
 	inode->idata_size = inode->i_size % erofs_blksiz(sbi);
@@ -814,6 +819,7 @@ noinline:
 	bh->fsprivate = erofs_igrab(inode);
 	bh->op = &erofs_write_inode_bhops;
 	inode->bh = bh;
+	inode->i_ino[0] = ++inode->sbi->inos;  /* inode serial number */
 	return 0;
 }
 
@@ -1107,7 +1113,6 @@ struct erofs_inode *erofs_new_inode(struct erofs_sb_info *sbi)
 		return ERR_PTR(-ENOMEM);
 
 	inode->sbi = sbi;
-	inode->i_ino[0] = sbi->inos++;	/* inode serial number */
 	inode->i_count = 1;
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 
