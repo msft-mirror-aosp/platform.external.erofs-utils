@@ -103,6 +103,7 @@ cc_defaults {
                 "liblz4",
                 "libselinux",
             ],
+            stl: "none",
         },
         host: {
             static_libs: [
@@ -113,6 +114,7 @@ cc_defaults {
                 "liblz4",
                 "libselinux",
             ],
+            stl: "c++_static",
         },
     },
 }
@@ -170,13 +172,6 @@ cc_binary {
     defaults: ["mkfs-erofs_defaults"],
     recovery: true,
     stem: "mkfs.erofs",
-}
-
-cc_binary_host {
-    name: "make_erofs",
-
-    defaults: ["mkfs-erofs_defaults"],
-    stl: "libc++_static"
 }
 
 cc_defaults {
