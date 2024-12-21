@@ -110,6 +110,17 @@ Set the universally unique identifier (UUID) of the filesystem to
 .IR UUID .
 The format of the UUID is a series of hex digits separated by hyphens,
 like this: "c1b9d5a2-f162-11cf-9ece-0020afc76f16".
+The
+.I UUID
+parameter may also be one of the following:
+.RS 1.2i
+.TP
+.I clear
+clear the file system UUID
+.TP
+.I random
+generate a new randomly-generated UUID
+.RE
 .TP
 .B \-\-all-root
 Make all files owned by root.
@@ -192,7 +203,18 @@ Use extended inodes instead of compact inodes if the file modification time
 would overflow compact inodes. This is the default. Overrides
 .BR --ignore-mtime .
 .TP
-.BI "\-\-tar, \-\-tar="MODE
+.BI "\-\-sort=" MODE
+Inode data sorting order for tarballs as input.
+
+\fIMODE\fR may be one of \fBnone\fR or \fBpath\fR.
+
+\fBnone\fR: No particular data order is specified for the target image to
+avoid unnecessary overhead; Currently, it takes effect if `-E^inline_data` is
+specified and no compression is applied.
+
+\fBpath\fR: Data order strictly follows the tree generation order. (default)
+.TP
+.BI "\-\-tar, \-\-tar=" MODE
 Treat \fISOURCE\fR as a tarball or tarball-like "headerball" rather than as a
 directory.
 
