@@ -6,6 +6,9 @@
  * with heavy changes by Gao Xiang <xiang@kernel.org>
  */
 #define _GNU_SOURCE
+#ifdef EROFS_MT_ENABLED
+#include <pthread.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -171,14 +174,12 @@ struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 	return d;
 }
 
-/* allocate main data for a inode */
-static int __allocate_inode_bh_data(struct erofs_inode *inode,
-				    unsigned long nblocks,
-				    int type)
+/* allocate main data for an inode */
+int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks)
 {
 	struct erofs_bufmgr *bmgr = inode->sbi->bmgr;
 	struct erofs_buffer_head *bh;
-	int ret;
+	int ret, type;
 
 	if (!nblocks) {
 		/* it has only tail-end data */
@@ -187,6 +188,7 @@ static int __allocate_inode_bh_data(struct erofs_inode *inode,
 	}
 
 	/* allocate main data buffer */
+	type = S_ISDIR(inode->i_mode) ? DIRA : DATA;
 	bh = erofs_balloc(bmgr, type, erofs_pos(inode->sbi, nblocks), 0, 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
@@ -431,7 +433,7 @@ static int erofs_write_dir_file(struct erofs_inode *dir)
 	q = used = blkno = 0;
 
 	/* allocate dir main data */
-	ret = __allocate_inode_bh_data(dir, erofs_blknr(sbi, dir->i_size), DIRA);
+	ret = erofs_allocate_inode_bh_data(dir, erofs_blknr(sbi, dir->i_size));
 	if (ret)
 		return ret;
 
@@ -487,7 +489,7 @@ int erofs_write_file_from_buffer(struct erofs_inode *inode, char *buf)
 
 	inode->datalayout = EROFS_INODE_FLAT_INLINE;
 
-	ret = __allocate_inode_bh_data(inode, nblocks, DATA);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks);
 	if (ret)
 		return ret;
 
@@ -514,15 +516,15 @@ static bool erofs_file_is_compressible(struct erofs_inode *inode)
 
 static int write_uncompressed_file_from_fd(struct erofs_inode *inode, int fd)
 {
-	int ret;
+	struct erofs_sb_info *sbi = inode->sbi;
 	erofs_blk_t nblocks, i;
 	unsigned int len;
-	struct erofs_sb_info *sbi = inode->sbi;
+	int ret;
 
 	inode->datalayout = EROFS_INODE_FLAT_INLINE;
 	nblocks = inode->i_size >> sbi->blkszbits;
 
-	ret = __allocate_inode_bh_data(inode, nblocks, DATA);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks);
 	if (ret)
 		return ret;
 
@@ -1139,7 +1141,7 @@ static struct erofs_inode *erofs_iget_from_srcpath(struct erofs_sb_info *sbi,
 	 * hard-link, just return it. Also don't lookup for directories
 	 * since hard-link directory isn't allowed.
 	 */
-	if (!S_ISDIR(st.st_mode)) {
+	if (!S_ISDIR(st.st_mode) && (!cfg.c_hard_dereference)) {
 		inode = erofs_iget(st.st_dev, st.st_ino);
 		if (inode)
 			return inode;
@@ -1196,7 +1198,8 @@ static int erofs_inode_reserve_data_blocks(struct erofs_inode *inode)
 	erofs_bdrop(bh, false);
 
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
-	tarerofs_blocklist_write(inode->u.i_blkaddr, nblocks, inode->i_ino[1]);
+	tarerofs_blocklist_write(inode->u.i_blkaddr, nblocks, inode->i_ino[1],
+				 alignedsz - inode->i_size);
 	return 0;
 }
 
@@ -1326,6 +1329,7 @@ struct erofs_mkfs_dfops {
 	pthread_cond_t full, empty, drain;
 	struct erofs_mkfs_jobitem *queue;
 	unsigned int entries, head, tail;
+	bool idle;	/* initialize as false before the dfops worker runs */
 };
 
 #define EROFS_MT_QUEUE_SIZE 128
@@ -1335,7 +1339,8 @@ static void erofs_mkfs_flushjobs(struct erofs_sb_info *sbi)
 	struct erofs_mkfs_dfops *q = sbi->mkfs_dfops;
 
 	pthread_mutex_lock(&q->lock);
-	pthread_cond_wait(&q->drain, &q->lock);
+	if (!q->idle)
+		pthread_cond_wait(&q->drain, &q->lock);
 	pthread_mutex_unlock(&q->lock);
 }
 
@@ -1345,6 +1350,8 @@ static void *erofs_mkfs_pop_jobitem(struct erofs_mkfs_dfops *q)
 
 	pthread_mutex_lock(&q->lock);
 	while (q->head == q->tail) {
+		/* the worker has handled everything only if sleeping here */
+		q->idle = true;
 		pthread_cond_signal(&q->drain);
 		pthread_cond_wait(&q->empty, &q->lock);
 	}
@@ -1388,8 +1395,10 @@ static int erofs_mkfs_go(struct erofs_sb_info *sbi,
 
 	item = q->queue + q->tail;
 	item->type = type;
-	memcpy(&item->u, elem, size);
+	if (size)
+		memcpy(&item->u, elem, size);
 	q->tail = (q->tail + 1) & (q->entries - 1);
+	q->idle = false;
 
 	pthread_cond_signal(&q->empty);
 	pthread_mutex_unlock(&q->lock);
@@ -1697,7 +1706,7 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 {
 	struct erofs_sb_info *sbi = root->sbi;
 	struct erofs_inode *dumpdir = erofs_igrab(root);
-	int err;
+	int err, err2;
 
 	erofs_mark_parent_inode(root, root);	/* rootdir mark */
 	root->next_dirwrite = NULL;
@@ -1708,6 +1717,12 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 		list_del(&root->i_hash);
 		erofs_insert_ihash(root);
 	} else if (cfg.c_root_xattr_isize) {
+		if (cfg.c_root_xattr_isize > EROFS_XATTR_ALIGN(
+				UINT16_MAX - sizeof(struct erofs_xattr_entry))) {
+			erofs_err("Invalid configuration for c_root_xattr_isize: %u (too large)",
+				  cfg.c_root_xattr_isize);
+			return -EINVAL;
+		}
 		root->xattr_isize = cfg.c_root_xattr_isize;
 	}
 
@@ -1724,7 +1739,6 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 	}
 
 	do {
-		int err;
 		struct erofs_inode *dir = dumpdir;
 		/* used for adding sub-directories in reverse order due to FIFO */
 		struct erofs_inode *head, **last = &head;
@@ -1738,7 +1752,8 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 				continue;
 
 			if (!erofs_inode_visited(inode)) {
-				DBG_BUGON(rebuild &&
+				DBG_BUGON(rebuild && (inode->i_nlink == 1 ||
+					  S_ISDIR(inode->i_mode)) &&
 					  erofs_parent_inode(inode) != dir);
 				erofs_mark_parent_inode(inode, dir);
 
@@ -1760,10 +1775,10 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 		}
 		*last = dumpdir;	/* fixup the last (or the only) one */
 		dumpdir = head;
-		err = erofs_mkfs_go(sbi, EROFS_MKFS_JOB_DIR_BH,
+		err2 = erofs_mkfs_go(sbi, EROFS_MKFS_JOB_DIR_BH,
 				    &dir, sizeof(dir));
-		if (err)
-			return err;
+		if (err || err2)
+			return err ? err : err2;
 	} while (dumpdir);
 
 	return err;
@@ -1812,7 +1827,7 @@ static int erofs_mkfs_build_tree(struct erofs_mkfs_buildtree_ctx *ctx)
 	int err, err2;
 	struct erofs_sb_info *sbi = ctx->sbi ? ctx->sbi : ctx->u.root->sbi;
 
-	q = malloc(sizeof(*q));
+	q = calloc(1, sizeof(*q));
 	if (!q)
 		return -ENOMEM;
 
@@ -1827,8 +1842,6 @@ static int erofs_mkfs_build_tree(struct erofs_mkfs_buildtree_ctx *ctx)
 	pthread_cond_init(&q->full, NULL);
 	pthread_cond_init(&q->drain, NULL);
 
-	q->head = 0;
-	q->tail = 0;
 	sbi->mkfs_dfops = q;
 	err = pthread_create(&sbi->dfops_worker, NULL,
 			     z_erofs_mt_dfops_worker, sbi);
@@ -1922,7 +1935,9 @@ struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_sb_info *sbi,
 
 		DBG_BUGON(!ictx);
 		ret = erofs_write_compressed_file(ictx);
-		if (ret && ret != -ENOSPC)
+		if (!ret)
+			goto out;
+		if (ret != -ENOSPC)
 			 return ERR_PTR(ret);
 
 		ret = lseek(fd, 0, SEEK_SET);
@@ -1932,6 +1947,7 @@ struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_sb_info *sbi,
 	ret = write_uncompressed_file_from_fd(inode, fd);
 	if (ret)
 		return ERR_PTR(ret);
+out:
 	erofs_prepare_inode_buffer(inode);
 	erofs_write_tail_end(inode);
 	return inode;

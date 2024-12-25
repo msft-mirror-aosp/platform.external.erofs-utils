@@ -3,9 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#if defined(HAVE_ZLIB)
-#include <zlib.h>
-#endif
 #include "erofs/print.h"
 #include "erofs/cache.h"
 #include "erofs/diskbuf.h"
@@ -15,6 +12,9 @@
 #include "erofs/xattr.h"
 #include "erofs/blobchunk.h"
 #include "erofs/rebuild.h"
+#if defined(HAVE_ZLIB)
+#include <zlib.h>
+#endif
 
 /* This file is a tape/volume header.  Ignore it on extraction.  */
 #define GNUTYPE_VOLHDR 'V'
@@ -38,6 +38,15 @@ struct tar_header {
 	char prefix[155];	/* 345-499 */
 	char padding[12];	/* 500-512 (pad to exactly the 512 byte) */
 };
+
+#ifdef HAVE_LIBLZMA
+#include <lzma.h>
+struct erofs_iostream_liblzma {
+	u8 inbuf[32768];
+	lzma_stream strm;
+	int fd;
+};
+#endif
 
 void erofs_iostream_close(struct erofs_iostream *ios)
 {
@@ -110,7 +119,7 @@ int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
 					   erofs_strerror(-errno));
 #endif
 		}
-		ios->bufsize = 16384;
+		ios->bufsize = 32768;
 	}
 
 	do {
@@ -274,9 +283,9 @@ static long long tarerofs_otoi(const char *ptr, int len)
 	inp[len] = '\0';
 
 	errno = 0;
-	val = strtol(ptr, &endp, 8);
-	if ((!val && endp == inp) |
-	     (*endp && *endp != ' '))
+	val = strtol(inp, &endp, 8);
+	if ((*endp == '\0' && endp == inp) |
+	    (*endp != '\0' && *endp != ' '))
 		errno = EINVAL;
 	return val;
 }
@@ -577,6 +586,38 @@ void tarerofs_remove_inode(struct erofs_inode *inode)
 	--inode->i_parent->i_nlink;
 }
 
+static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
+					    struct erofs_tarfile *tar)
+{
+	struct erofs_sb_info *sbi = inode->sbi;
+	erofs_blk_t nblocks;
+	erofs_off_t pos;
+	void *buf;
+	int ret;
+
+	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
+	nblocks = DIV_ROUND_UP(inode->i_size, 1U << sbi->blkszbits);
+
+	ret = erofs_allocate_inode_bh_data(inode, nblocks);
+	if (ret)
+		return ret;
+
+	for (pos = 0; pos < inode->i_size; pos += ret) {
+		ret = erofs_iostream_read(&tar->ios, &buf, inode->i_size - pos);
+		if (ret < 0)
+			break;
+		if (erofs_dev_write(sbi, buf,
+				    erofs_pos(sbi, inode->u.i_blkaddr) + pos,
+				    ret)) {
+			ret = -EIO;
+			break;
+		}
+	}
+	inode->idata_size = 0;
+	inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
+	return 0;
+}
+
 static int tarerofs_write_file_data(struct erofs_inode *inode,
 				    struct erofs_tarfile *tar)
 {
@@ -626,6 +667,7 @@ int tarerofs_parse_tar(struct erofs_inode *root, struct erofs_tarfile *tar)
 	unsigned int j, csum, cksum;
 	int ckksum, ret, rem;
 
+	root->dev = tar->dev;
 	if (eh.path)
 		eh.path = strdup(eh.path);
 	if (eh.link)
@@ -654,18 +696,19 @@ restart:
 		goto out;
 	}
 	tar->offset += sizeof(*th);
-	if (*th->name == '\0') {
-		if (e) {	/* end of tar 2 empty blocks */
-			ret = 1;
-			goto out;
-		}
-		e = true;	/* empty jump to next block */
-		goto restart;
-	}
 
 	/* chksum field itself treated as ' ' */
 	csum = tarerofs_otoi(th->chksum, sizeof(th->chksum));
 	if (errno) {
+		if (*th->name == '\0') {
+out_eot:
+			if (e) {	/* end of tar 2 empty blocks */
+				ret = 1;
+				goto out;
+			}
+			e = true;	/* empty jump to next block */
+			goto restart;
+		}
 		erofs_err("invalid chksum @ %llu", tar_offset);
 		ret = -EBADMSG;
 		goto out;
@@ -683,6 +726,11 @@ restart:
 		ckksum += (int)((char*)th)[j];
 	}
 	if (!tar->ddtaridx_mode && csum != cksum && csum != ckksum) {
+		/* should not bail out here, just in case */
+		if (*th->name == '\0') {
+			DBG_BUGON(1);
+			goto out_eot;
+		}
 		erofs_err("chksum mismatch @ %llu", tar_offset);
 		ret = -EBADMSG;
 		goto out;
@@ -761,13 +809,14 @@ restart:
 	}
 
 	dataoff = tar->offset;
-	if (!(tar->headeronly_mode || tar->ddtaridx_mode))
-		tar->offset += st.st_size;
+	tar->offset += st.st_size;
 	switch(th->typeflag) {
 	case '0':
 	case '7':
 	case '1':
 		st.st_mode |= S_IFREG;
+		if (tar->headeronly_mode || tar->ddtaridx_mode)
+			tar->offset -= st.st_size;
 		break;
 	case '2':
 		st.st_mode |= S_IFLNK;
@@ -997,6 +1046,10 @@ new_inode:
 				if (!ret && erofs_iostream_lskip(&tar->ios,
 								 inode->i_size))
 					ret = -EIO;
+			} else if (tar->try_no_reorder &&
+				   !cfg.c_compr_opts[0].alg &&
+				   !cfg.c_inline_data) {
+				ret = tarerofs_write_uncompressed_file(inode, tar);
 			} else {
 				ret = tarerofs_write_file_data(inode, tar);
 			}
