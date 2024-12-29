@@ -8,12 +8,12 @@ third_party {
   license_type: RESTRICTED
   last_upgrade_date {
     year: 2024
-    month: 9
-    day: 16
+    month: 12
+    day: 18
   }
   identifier {
     type: "Git"
     value: "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git"
-    version: "v1.8.1"
+    version: "v1.8.3"
   }
 }
