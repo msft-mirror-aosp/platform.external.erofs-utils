@@ -84,6 +84,8 @@ static struct option long_options[] = {
 	{"root-xattr-isize", required_argument, NULL, 524},
 	{"mkfs-time", no_argument, NULL, 525},
 	{"all-time", no_argument, NULL, 526},
+	{"sort", required_argument, NULL, 527},
+	{"hard-dereference", no_argument, NULL, 528},
 	{0, 0, 0, 0},
 };
 
@@ -151,7 +153,7 @@ static void usage(int argc, char **argv)
 	printf(
 		" -C#                   specify the size of compress physical cluster in bytes\n"
 		" -EX[,...]             X=extended options\n"
-		" -L volume-label       set the volume label (maximum 16)\n"
+		" -L volume-label       set the volume label (maximum 15 bytes)\n"
 		" -T#                   specify a fixed UNIX timestamp # as build time\n"
 		"    --all-time         the timestamp is also applied to all files (default)\n"
 		"    --mkfs-time        the timestamp is applied as build time only\n"
@@ -173,6 +175,7 @@ static void usage(int argc, char **argv)
 		" --force-gid=#         set all file gids to # (# = GID)\n"
 		" --uid-offset=#        add offset # to all file uids (# = id offset)\n"
 		" --gid-offset=#        add offset # to all file gids (# = id offset)\n"
+		" --hard-dereference    dereference hardlinks, add links as separate inodes\n"
 		" --ignore-mtime        use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#  set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X       X=prefix of target fs path (default: /)\n"
@@ -180,6 +183,7 @@ static void usage(int argc, char **argv)
 		" --offset=#            skip # bytes at the beginning of IMAGE.\n"
 		" --root-xattr-isize=#  ensure the inline xattr size of the root directory is # bytes at least\n"
 		" --aufs                replace aufs special files with overlayfs metadata\n"
+		" --sort=<path,none>    data sorting order for tarballs as input (default: path)\n"
 		" --tar=X               generate a full or index-only image from a tarball(-ish) source\n"
 		"                       (X = f|i|headerball; f=full mode, i=index mode,\n"
 		"                                            headerball=file data is omited in the source stream)\n"
@@ -274,7 +278,7 @@ static int erofs_mkfs_feat_set_fragments(bool en, const char *val,
 		u64 i = strtoull(val, &endptr, 0);
 
 		if (endptr - val != vallen) {
-			erofs_err("invalid pcluster size %s for the packed file %s", val);
+			erofs_err("invalid pcluster size %s for the packed file", val);
 			return -EINVAL;
 		}
 		pclustersize_packed = i;
@@ -598,7 +602,7 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 
 		case 'L':
 			if (optarg == NULL ||
-			    strlen(optarg) > sizeof(g_sbi.volume_name)) {
+			    strlen(optarg) > (sizeof(g_sbi.volume_name) - 1u)) {
 				erofs_err("invalid volume label");
 				return -EINVAL;
 			}
@@ -615,7 +619,12 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 			has_timestamp = true;
 			break;
 		case 'U':
-			if (erofs_uuid_parse(optarg, fixeduuid)) {
+			if (!strcmp(optarg, "clear")) {
+				memset(fixeduuid, 0, 16);
+			} else if (!strcmp(optarg, "random")) {
+				valid_fixeduuid = false;
+				break;
+			} else if (erofs_uuid_parse(optarg, fixeduuid)) {
 				erofs_err("invalid UUID %s", optarg);
 				return -EINVAL;
 			}
@@ -840,6 +849,13 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 		case 526:
 			cfg.c_timeinherit = TIMESTAMP_FIXED;
 			break;
+		case 527:
+			if (!strcmp(optarg, "none"))
+				erofstar.try_no_reorder = true;
+			break;
+		case 528:
+			cfg.c_hard_dereference = true;
+			break;
 		case 'V':
 			version();
 			exit(0);
@@ -965,11 +981,6 @@ static int mkfs_parse_options_cfg(int argc, char *argv[])
 		cfg.c_showprogress = false;
 	}
 
-	if (cfg.c_compr_opts[0].alg && erofs_blksiz(&g_sbi) != getpagesize())
-		erofs_warn("Please note that subpage blocksize with compression isn't yet supported in kernel. "
-			   "This compressed image will only work with bs = ps = %u bytes",
-			   erofs_blksiz(&g_sbi));
-
 	if (pclustersize_max) {
 		if (pclustersize_max < erofs_blksiz(&g_sbi) ||
 		    pclustersize_max % erofs_blksiz(&g_sbi)) {
@@ -1091,7 +1102,8 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 	if (datamode != EROFS_REBUILD_DATA_BLOB_INDEX)
 		return 0;
 
-	if (extra_devices != rebuild_src_count) {
+	/* Each blob has either no extra device or only one device for TarFS */
+	if (extra_devices && extra_devices != rebuild_src_count) {
 		erofs_err("extra_devices(%u) is mismatched with source images(%u)",
 			  extra_devices, rebuild_src_count);
 		return -EOPNOTSUPP;

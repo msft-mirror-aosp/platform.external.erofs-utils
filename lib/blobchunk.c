@@ -95,7 +95,8 @@ static struct erofs_blobchunk *erofs_blob_getchunk(struct erofs_sb_info *sbi,
 		chunk->device_id = 0;
 	chunk->blkaddr = erofs_blknr(sbi, blkpos);
 
-	erofs_dbg("Writing chunk (%u bytes) to %u", chunksize, chunk->blkaddr);
+	erofs_dbg("Writing chunk (%llu bytes) to %u", chunksize | 0ULL,
+		  chunk->blkaddr);
 	ret = fwrite(buf, chunksize, 1, blobfile);
 	if (ret == 1) {
 		padding = erofs_blkoff(sbi, chunksize);
@@ -132,11 +133,13 @@ static int erofs_blob_hashmap_cmp(const void *a, const void *b,
 int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 				   erofs_off_t off)
 {
+	struct erofs_sb_info *sbi = inode->sbi;
+	erofs_blk_t remaining_blks = BLK_ROUND_UP(sbi, inode->i_size);
 	struct erofs_inode_chunk_index idx = {0};
 	erofs_blk_t extent_start = EROFS_NULL_ADDR;
 	erofs_blk_t extent_end, chunkblks;
 	erofs_off_t source_offset;
-	unsigned int dst, src, unit;
+	unsigned int dst, src, unit, zeroedlen;
 	bool first_extent = true;
 
 	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
@@ -164,9 +167,10 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 		if (extent_start == EROFS_NULL_ADDR ||
 		    idx.blkaddr != extent_end) {
 			if (extent_start != EROFS_NULL_ADDR) {
+				remaining_blks -= extent_end - extent_start;
 				tarerofs_blocklist_write(extent_start,
 						extent_end - extent_start,
-						source_offset);
+						source_offset, 0);
 				erofs_droid_blocklist_write_extent(inode,
 					extent_start,
 					extent_end - extent_start,
@@ -186,9 +190,14 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 			memcpy(inode->chunkindexes + dst, &idx, sizeof(idx));
 	}
 	off = roundup(off, unit);
-	if (extent_start != EROFS_NULL_ADDR)
+	extent_end = min(extent_end, extent_start + remaining_blks);
+	if (extent_start != EROFS_NULL_ADDR) {
+		zeroedlen = inode->i_size & (erofs_blksiz(sbi) - 1);
+		if (zeroedlen)
+			zeroedlen = erofs_blksiz(sbi) - zeroedlen;
 		tarerofs_blocklist_write(extent_start, extent_end - extent_start,
-					 source_offset);
+					 source_offset, zeroedlen);
+	}
 	erofs_droid_blocklist_write_extent(inode, extent_start,
 			extent_start == EROFS_NULL_ADDR ?
 					0 : extent_end - extent_start,
@@ -476,9 +485,8 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 {
 	struct erofs_buffer_head *bh;
-	ssize_t length;
+	ssize_t length, ret;
 	u64 pos_in, pos_out;
-	ssize_t ret;
 
 	if (blobfile) {
 		fflush(blobfile);
@@ -528,9 +536,21 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 	pos_out += sbi->bdev.offset;
 	if (blobfile) {
 		pos_in = 0;
-		ret = erofs_copy_file_range(fileno(blobfile), &pos_in,
-				sbi->bdev.fd, &pos_out, datablob_size);
-		ret = ret < datablob_size ? -EIO : 0;
+		do {
+			length = min_t(erofs_off_t, datablob_size,  SSIZE_MAX);
+			ret = erofs_copy_file_range(fileno(blobfile), &pos_in,
+					sbi->bdev.fd, &pos_out, length);
+		} while (ret > 0 && (datablob_size -= ret));
+
+		if (ret >= 0) {
+			if (datablob_size) {
+				erofs_err("failed to append the remaining %llu-byte chunk data",
+					  datablob_size);
+				ret = -EIO;
+			} else {
+				ret = 0;
+			}
+		}
 	} else {
 		ret = erofs_io_ftruncate(&sbi->bdev, pos_out + datablob_size);
 	}
