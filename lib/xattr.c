@@ -138,8 +138,8 @@ struct ea_type_node {
 static LIST_HEAD(ea_name_prefixes);
 static unsigned int ea_prefix_count;
 
-static bool match_prefix(const char *key, unsigned int *index,
-			 unsigned int *len)
+bool erofs_xattr_prefix_matches(const char *key, unsigned int *index,
+				unsigned int *len)
 {
 	struct xattr_prefix *p;
 
@@ -169,6 +169,7 @@ static unsigned int put_xattritem(struct xattr_item *item)
 {
 	if (item->count > 1)
 		return --item->count;
+	hash_del(&item->node);
 	free(item);
 	return 0;
 }
@@ -196,7 +197,8 @@ static struct xattr_item *get_xattritem(char *kvbuf, unsigned int len[2])
 	if (!item)
 		return ERR_PTR(-ENOMEM);
 
-	if (!match_prefix(kvbuf, &item->base_index, &item->prefix_len)) {
+	if (!erofs_xattr_prefix_matches(kvbuf, &item->base_index,
+					&item->prefix_len)) {
 		free(item);
 		return ERR_PTR(-ENODATA);
 	}
@@ -448,6 +450,9 @@ static int read_xattrs_from_file(const char *path, mode_t mode,
 			ret = PTR_ERR(item);
 			goto err;
 		}
+		/* skip unidentified xattrs */
+		if (!item)
+			continue;
 
 		ret = erofs_xattr_add(ixattrs, item);
 		if (ret < 0)
@@ -794,10 +799,10 @@ static int comp_shared_xattr_item(const void *a, const void *b)
 
 	ia = *((const struct xattr_item **)a);
 	ib = *((const struct xattr_item **)b);
-	la = ia->len[0] + ia->len[1];
-	lb = ib->len[0] + ib->len[1];
+	la = EROFS_XATTR_KVSIZE(ia->len);
+	lb = EROFS_XATTR_KVSIZE(ib->len);
 
-	ret = strncmp(ia->kvbuf, ib->kvbuf, min(la, lb));
+	ret = memcmp(ia->kvbuf, ib->kvbuf, min(la, lb));
 	if (ret != 0)
 		return ret;
 
@@ -1422,7 +1427,7 @@ int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 	if (ret)
 		return ret;
 
-	if (!match_prefix(name, &prefix, &prefixlen))
+	if (!erofs_xattr_prefix_matches(name, &prefix, &prefixlen))
 		return -ENODATA;
 
 	it.it.sbi = vi->sbi;
@@ -1597,7 +1602,8 @@ int erofs_xattr_insert_name_prefix(const char *prefix)
 	if (!tnode)
 		return -ENOMEM;
 
-	if (!match_prefix(prefix, &tnode->base_index, &tnode->base_len)) {
+	if (!erofs_xattr_prefix_matches(prefix, &tnode->base_index,
+					&tnode->base_len)) {
 		free(tnode);
 		return -ENODATA;
 	}
