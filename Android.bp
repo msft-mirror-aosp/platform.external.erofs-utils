@@ -76,6 +76,9 @@ cc_defaults {
         "-D_FILE_OFFSET_BITS=64",
         "-DEROFS_MAX_BLOCK_SIZE=16384",
         "-DHAVE_UTIMENSAT",
+        "-DHAVE_UNISTD_H",
+        "-DHAVE_SYSCONF",
+        "-DEROFS_MT_ENABLED",
     ],
 }
 
@@ -130,7 +133,6 @@ cc_library {
     exclude_srcs: [
         "lib/compressor_libdeflate.c",
         "lib/compressor_libzstd.c",
-        "lib/workqueue.c",
     ],
     export_include_dirs: ["include"],
 
