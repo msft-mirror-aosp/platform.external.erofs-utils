@@ -34,6 +34,8 @@ struct erofsfsck_cfg {
 	bool preserve_owner;
 	bool preserve_perms;
 	bool dump_xattrs;
+	erofs_nid_t nid;
+	const char *inode_path;
 };
 static struct erofsfsck_cfg fsckcfg;
 
@@ -53,6 +55,8 @@ static struct option long_options[] = {
 	{"offset", required_argument, 0, 12},
 	{"xattrs", no_argument, 0, 13},
 	{"no-xattrs", no_argument, 0, 14},
+	{"nid", required_argument, 0, 15},
+	{"path", required_argument, 0, 16},
 	{0, 0, 0, 0},
 };
 
@@ -103,6 +107,8 @@ static void usage(int argc, char **argv)
 		" --extract[=X]          check if all files are well encoded, optionally\n"
 		"                        extract to X\n"
 		" --offset=#             skip # bytes at the beginning of IMAGE\n"
+		" --nid=#                check or extract from the target inode of nid #\n"
+		" --path=X               check or extract from the target inode of path X\n"
 		" --[no-]xattrs          whether to dump extended attributes (default off)\n"
 		"\n"
 		" -a, -A, -y             no-op, for compatibility with fsck of other filesystems\n"
@@ -236,6 +242,12 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 			break;
 		case 14:
 			fsckcfg.dump_xattrs = false;
+			break;
+		case 15:
+			fsckcfg.nid = (erofs_nid_t)atoll(optarg);
+			break;
+		case 16:
+			fsckcfg.inode_path = optarg;
 			break;
 		default:
 			return -EINVAL;
@@ -896,6 +908,22 @@ again:
 	return ret;
 }
 
+struct erofsfsck_get_parent_ctx {
+	struct erofs_dir_context ctx;
+	erofs_nid_t pnid;
+};
+
+static int erofsfsck_get_parent_cb(struct erofs_dir_context *ctx)
+{
+	struct erofsfsck_get_parent_ctx *pctx = (void *)ctx;
+
+	if (ctx->dot_dotdot && ctx->de_namelen == 2) {
+		pctx->pnid = ctx->de_nid;
+		return 1;
+	}
+	return 0;
+}
+
 static int erofsfsck_dirent_iter(struct erofs_dir_context *ctx)
 {
 	int ret;
@@ -1065,6 +1093,8 @@ int main(int argc, char *argv[])
 	fsckcfg.preserve_owner = fsckcfg.superuser;
 	fsckcfg.preserve_perms = fsckcfg.superuser;
 	fsckcfg.dump_xattrs = false;
+	fsckcfg.nid = 0;
+	fsckcfg.inode_path = NULL;
 
 	err = erofsfsck_parse_options_cfg(argc, argv);
 	if (err) {
@@ -1097,15 +1127,49 @@ int main(int argc, char *argv[])
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_init();
 
-	if (erofs_sb_has_fragments(&g_sbi) && g_sbi.packed_nid > 0) {
-		err = erofsfsck_check_inode(g_sbi.packed_nid, g_sbi.packed_nid);
+	if (fsckcfg.inode_path) {
+		struct erofs_inode inode = { .sbi = &g_sbi };
+
+		err = erofs_ilookup(fsckcfg.inode_path, &inode);
 		if (err) {
-			erofs_err("failed to verify packed file");
+			erofs_err("failed to lookup %s", fsckcfg.inode_path);
 			goto exit_hardlink;
+		}
+		fsckcfg.nid = inode.nid;
+	} else if (!fsckcfg.nid) {
+		fsckcfg.nid = g_sbi.root_nid;
+	}
+
+	if (!fsckcfg.inode_path && fsckcfg.nid == g_sbi.root_nid) {
+		if (erofs_sb_has_fragments(&g_sbi) && g_sbi.packed_nid > 0) {
+			err = erofsfsck_check_inode(g_sbi.packed_nid, g_sbi.packed_nid);
+			if (err) {
+				erofs_err("failed to verify packed file");
+				goto exit_hardlink;
+			}
 		}
 	}
 
-	err = erofsfsck_check_inode(g_sbi.root_nid, g_sbi.root_nid);
+	{
+		erofs_nid_t pnid = fsckcfg.nid;
+
+		if (fsckcfg.nid != g_sbi.root_nid) {
+			struct erofs_inode inode = { .sbi = &g_sbi, .nid = fsckcfg.nid };
+
+			if (!erofs_read_inode_from_disk(&inode) &&
+			    S_ISDIR(inode.i_mode)) {
+				struct erofsfsck_get_parent_ctx ctx = {
+					.ctx.dir = &inode,
+					.ctx.cb = erofsfsck_get_parent_cb,
+				};
+
+				if (erofs_iterate_dir(&ctx.ctx, false) == 1)
+					pnid = ctx.pnid;
+			}
+		}
+		err = erofsfsck_check_inode(pnid, fsckcfg.nid);
+	}
+
 	if (fsckcfg.corrupted) {
 		if (!fsckcfg.extract_path)
 			erofs_err("Found some filesystem corruption");
